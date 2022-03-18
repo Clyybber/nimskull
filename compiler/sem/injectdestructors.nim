@@ -78,10 +78,12 @@ const toDebug {.strdefine.} = ""
 when toDebug.len > 0:
   var shouldDebug = false
 
-template dbg(body) =
+template dbg*(body) =
   when toDebug.len > 0:
     if shouldDebug:
       body
+
+import compiler/sem/dfa_analysis
 
 proc hasDestructor(c: Con; t: PType): bool {.inline.} =
   result = ast.hasDestructor(t)
@@ -101,162 +103,6 @@ proc nestedScope(parent: var Scope): Scope =
 
 proc p(n: PNode; c: var Con; s: var Scope; mode: ProcessMode): PNode
 proc moveOrCopy(dest, ri: PNode; c: var Con; s: var Scope; isDecl = false): PNode
-
-import sets, hashes
-
-proc hash(n: PNode): Hash = hash(cast[pointer](n))
-
-proc aliasesCached(cache: var Table[(PNode, PNode), AliasKind], obj, field: PNode): AliasKind =
-  let key = (obj, field)
-  if not cache.hasKey(key):
-    cache[key] = aliases(obj, field)
-  cache[key]
-
-type
-  State = ref object
-    lastReads: IntSet
-    potentialLastReads: IntSet
-    notLastReads: IntSet
-    alreadySeen: HashSet[PNode]
-
-proc preprocessCfg(cfg: var ControlFlowGraph) =
-  for i in 0..<cfg.len:
-    if cfg[i].kind in {goto, fork} and i + cfg[i].dest > cfg.len:
-      cfg[i].dest = cfg.len - i
-
-proc mergeStates(a: var State, b: sink State) =
-  # Inplace for performance:
-  #   lastReads = a.lastReads + b.lastReads
-  #   potentialLastReads = (a.potentialLastReads + b.potentialLastReads) - (a.notLastReads + b.notLastReads)
-  #   notLastReads = a.notLastReads + b.notLastReads
-  #   alreadySeen = a.alreadySeen + b.alreadySeen
-  # b is never nil
-  if a == nil:
-    a = b
-  else:
-    a.lastReads.incl b.lastReads
-    a.potentialLastReads.incl b.potentialLastReads
-    a.potentialLastReads.excl a.notLastReads
-    a.potentialLastReads.excl b.notLastReads
-    a.notLastReads.incl b.notLastReads
-    a.alreadySeen.incl b.alreadySeen
-
-proc computeLastReadsAndFirstWrites(cfg: ControlFlowGraph) =
-  var cache = initTable[(PNode, PNode), AliasKind]()
-  template aliasesCached(obj, field: PNode): AliasKind =
-    aliasesCached(cache, obj, field)
-
-  var cfg = cfg
-  preprocessCfg(cfg)
-
-  var states = newSeq[State](cfg.len + 1)
-  states[0] = State()
-
-  for pc in 0..<cfg.len:
-    template state: State = states[pc]
-    if state != nil:
-      case cfg[pc].kind
-      of def:
-        var potentialLastReadsCopy = state.potentialLastReads
-        for r in potentialLastReadsCopy:
-          if cfg[pc].n.aliasesCached(cfg[r].n) == yes:
-            # the path leads to a redefinition of 's' --> sink 's'.
-            state.lastReads.incl r
-            state.potentialLastReads.excl r
-          elif cfg[r].n.aliasesCached(cfg[pc].n) != no:
-            # only partially writes to 's' --> can't sink 's', so this def reads 's'
-            # or maybe writes to 's' --> can't sink 's'
-            cfg[r].n.comment = '\n' & $pc
-            state.potentialLastReads.excl r
-            state.notLastReads.incl r
-
-        var alreadySeenThisNode = false
-        for s in state.alreadySeen:
-          if cfg[pc].n.aliasesCached(s) != no or s.aliasesCached(cfg[pc].n) != no:
-            alreadySeenThisNode = true; break
-        if alreadySeenThisNode: cfg[pc].n.flags.excl nfFirstWrite
-        else: cfg[pc].n.flags.incl nfFirstWrite
-
-        state.alreadySeen.incl cfg[pc].n
-
-        mergeStates(states[pc + 1], move(states[pc]))
-      of use:
-        var potentialLastReadsCopy = state.potentialLastReads
-        for r in potentialLastReadsCopy:
-          if cfg[pc].n.aliasesCached(cfg[r].n) != no or cfg[r].n.aliasesCached(cfg[pc].n) != no:
-            cfg[r].n.comment = '\n' & $pc
-            state.potentialLastReads.excl r
-            state.notLastReads.incl r
-
-        state.potentialLastReads.incl pc
-
-        state.alreadySeen.incl cfg[pc].n
-
-        mergeStates(states[pc + 1], move(states[pc]))
-      of goto:
-        mergeStates(states[pc + cfg[pc].dest], move(states[pc]))
-      of fork:
-        var copy = State()
-        copy[] = states[pc][]
-        mergeStates(states[pc + cfg[pc].dest], copy)
-        mergeStates(states[pc + 1], move(states[pc]))
-
-  let lastReads = (states[^1].lastReads + states[^1].potentialLastReads) - states[^1].notLastReads
-  var lastReadTable: Table[PNode, seq[int]]
-  for position, node in cfg:
-    if node.kind == use:
-      lastReadTable.mgetOrPut(node.n, @[]).add position
-  for node, positions in lastReadTable:
-    block checkIfAllPosLastRead:
-      for p in positions:
-        if p notin lastReads: break checkIfAllPosLastRead
-      node.flags.incl nfLastRead
-
-proc isLastRead(n: PNode; c: var Con): bool =
-  let m = dfa.skipConvDfa(n)
-  (m.kind == nkSym and sfSingleUsedTemp in m.sym.flags) or nfLastRead in m.flags
-
-proc isFirstWrite(n: PNode; c: var Con): bool =
-  let m = dfa.skipConvDfa(n)
-  nfFirstWrite in m.flags
-
-proc initialized(code: ControlFlowGraph; pc: int,
-                 init, uninit: var IntSet; until: int): int =
-  ## Computes the set of definitely initialized variables across all code paths
-  ## as an IntSet of IDs.
-  var pc = pc
-  while pc < code.len:
-    case code[pc].kind
-    of goto:
-      pc += code[pc].dest
-    of fork:
-      var initA = initIntSet()
-      var initB = initIntSet()
-      var variantA = pc + 1
-      var variantB = pc + code[pc].dest
-      while variantA != variantB:
-        if max(variantA, variantB) > until:
-          break
-        if variantA < variantB:
-          variantA = initialized(code, variantA, initA, uninit, min(variantB, until))
-        else:
-          variantB = initialized(code, variantB, initB, uninit, min(variantA, until))
-      pc = min(variantA, variantB)
-      # we add vars if they are in both branches:
-      for v in initA:
-        if v in initB:
-          init.incl v
-    of use:
-      let v = code[pc].n.sym
-      if v.kind != skParam and v.id notin init:
-        # attempt to read an uninit'ed variable
-        uninit.incl v.id
-      inc pc
-    of def:
-      let v = code[pc].n.sym
-      init.incl v.id
-      inc pc
-  return pc
 
 proc isCursor(n: PNode): bool =
   case n.kind
@@ -341,7 +187,7 @@ proc isNoInit(dest: PNode): bool {.inline.} =
 
 proc genSink(c: var Con; dest, ri: PNode, isDecl = false): PNode =
   if (c.inLoopCond == 0 and (isUnpackedTuple(dest) or isDecl or
-      (isAnalysableFieldAccess(dest, c.owner) and isFirstWrite(dest, c)))) or
+      (isAnalysableFieldAccess(dest, c.owner) and isFirstWrite(dest)))) or
       isNoInit(dest):
     # optimize sink call into a bitwise memcopy
     result = newTree(nkFastAsgn, dest, ri)
@@ -763,7 +609,7 @@ proc p(n: PNode; c: var Con; s: var Scope; mode: ProcessMode): PNode =
          nkCallKinds + nkLiterals:
       result = p(n, c, s, consumed)
     elif ((n.kind == nkSym and isSinkParam(n.sym)) or isAnalysableFieldAccess(n, c.owner)) and
-        isLastRead(n, c) and not (n.kind == nkSym and isCursor(n)):
+        isLastRead(n) and not (n.kind == nkSym and isCursor(n)):
       # Sinked params can be consumed only once. We need to reset the memory
       # to disable the destructor which we have not elided
       result = destructiveMoveVar(n, c, s)
@@ -956,7 +802,7 @@ proc p(n: PNode; c: var Con; s: var Scope; mode: ProcessMode): PNode =
       for i in 1 ..< n.len:
         result[i] = n[i]
       if mode == sinkArg and hasDestructor(c, n.typ):
-        if isAnalysableFieldAccess(n, c.owner) and isLastRead(n, c):
+        if isAnalysableFieldAccess(n, c.owner) and isLastRead(n):
           s.wasMoved.add c.genWasMoved(n)
         else:
           result = passCopyToSink(result, c, s)
@@ -966,7 +812,7 @@ proc p(n: PNode; c: var Con; s: var Scope; mode: ProcessMode): PNode =
       for i in 0 ..< n.len:
         result[i] = p(n[i], c, s, normal)
       if mode == sinkArg and hasDestructor(c, n.typ):
-        if isAnalysableFieldAccess(n, c.owner) and isLastRead(n, c):
+        if isAnalysableFieldAccess(n, c.owner) and isLastRead(n):
           # consider 'a[(g; destroy(g); 3)]', we want to say 'wasMoved(a[3])'
           # without the junk, hence 'c.genWasMoved(n)'
           # and not 'c.genWasMoved(result)':
@@ -1047,7 +893,7 @@ proc moveOrCopy(dest, ri: PNode; c: var Con; s: var Scope, isDecl = false): PNod
       if isUnpackedTuple(ri[0]):
         # unpacking of tuple: take over the elements
         result = c.genSink(dest, p(ri, c, s, consumed), isDecl)
-      elif isAnalysableFieldAccess(ri, c.owner) and isLastRead(ri, c):
+      elif isAnalysableFieldAccess(ri, c.owner) and isLastRead(ri):
         if aliases(dest, ri) == no:
           # Rule 3: `=sink`(x, z); wasMoved(z)
           var snk = c.genSink(dest, ri, isDecl)
@@ -1069,12 +915,12 @@ proc moveOrCopy(dest, ri: PNode; c: var Con; s: var Scope, isDecl = false): PNod
     of nkObjConstr, nkTupleConstr, nkClosure, nkCharLit..nkNilLit:
       result = c.genSink(dest, p(ri, c, s, consumed), isDecl)
     of nkSym:
-      if isSinkParam(ri.sym) and isLastRead(ri, c):
+      if isSinkParam(ri.sym) and isLastRead(ri):
         # Rule 3: `=sink`(x, z); wasMoved(z)
         let snk = c.genSink(dest, ri, isDecl)
         result = newTree(nkStmtList, snk, c.genWasMoved(ri))
       elif ri.sym.kind != skParam and ri.sym.owner == c.owner and
-          isLastRead(ri, c) and canBeMoved(c, dest.typ) and not isCursor(ri):
+          isLastRead(ri) and canBeMoved(c, dest.typ) and not isCursor(ri):
         # Rule 3: `=sink`(x, z); wasMoved(z)
         let snk = c.genSink(dest, ri, isDecl)
         result = newTree(nkStmtList, snk, c.genWasMoved(ri))
@@ -1091,7 +937,7 @@ proc moveOrCopy(dest, ri: PNode; c: var Con; s: var Scope, isDecl = false): PNod
     of nkRaiseStmt:
       result = pRaiseStmt(ri, c, s)
     else:
-      if isAnalysableFieldAccess(ri, c.owner) and isLastRead(ri, c) and
+      if isAnalysableFieldAccess(ri, c.owner) and isLastRead(ri) and
           canBeMoved(c, dest.typ):
         # Rule 3: `=sink`(x, z); wasMoved(z)
         let snk = c.genSink(dest, ri, isDecl)
