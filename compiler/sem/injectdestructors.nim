@@ -39,7 +39,8 @@ import
     options
   ],
   compiler/sem/[
-    dfa,
+    dfa/dfa,
+    dfa/dfa_analysis,
     lowerings,
     parampatterns,
     sighashes,
@@ -73,17 +74,6 @@ type
     normal
     consumed
     sinkArg
-
-const toDebug {.strdefine.} = ""
-when toDebug.len > 0:
-  var shouldDebug = false
-
-template dbg*(body) =
-  when toDebug.len > 0:
-    if shouldDebug:
-      body
-
-import compiler/sem/dfa_analysis
 
 proc hasDestructor(c: Con; t: PType): bool {.inline.} =
   result = ast.hasDestructor(t)
@@ -947,31 +937,32 @@ proc moveOrCopy(dest, ri: PNode; c: var Con; s: var Scope, isDecl = false): PNod
         result.add p(ri, c, s, consumed)
         c.finishCopy(result, dest, isFromSink = false)
 
-proc computeUninit(c: var Con) =
-  if not c.uninitComputed:
-    c.uninitComputed = true
-    c.uninit = initIntSet()
-    var init = initIntSet()
-    discard initialized(c.g, pc = 0, init, c.uninit, int.high)
+when false:
+  proc computeUninit(c: var Con) =
+    if not c.uninitComputed:
+      c.uninitComputed = true
+      c.uninit = initIntSet()
+      var init = initIntSet()
+      discard initialized(c.g, pc = 0, init, c.uninit, int.high)
 
-proc injectDefaultCalls(n: PNode, c: var Con) =
-  case n.kind
-  of nkVarSection, nkLetSection:
-    for it in n:
-      if it.kind == nkIdentDefs and it[^1].kind == nkEmpty:
-        computeUninit(c)
-        for j in 0..<it.len-2:
-          let v = it[j]
-          doAssert v.kind == nkSym
-          if c.uninit.contains(v.sym.id):
-            it[^1] = genDefaultCall(v.sym.typ, c, v.info)
-            break
-  of nkNone..nkNilLit, nkTypeSection, nkProcDef, nkConverterDef, nkMethodDef,
-      nkIteratorDef, nkMacroDef, nkTemplateDef, nkLambda, nkDo, nkFuncDef:
-    discard
-  else:
-    for i in 0..<n.safeLen:
-      injectDefaultCalls(n[i], c)
+  proc injectDefaultCalls(n: PNode, c: var Con) =
+    case n.kind
+    of nkVarSection, nkLetSection:
+      for it in n:
+        if it.kind == nkIdentDefs and it[^1].kind == nkEmpty:
+          computeUninit(c)
+          for j in 0..<it.len-2:
+            let v = it[j]
+            doAssert v.kind == nkSym
+            if c.uninit.contains(v.sym.id):
+              it[^1] = genDefaultCall(v.sym.typ, c, v.info)
+              break
+    of nkNone..nkNilLit, nkTypeSection, nkProcDef, nkConverterDef, nkMethodDef,
+        nkIteratorDef, nkMacroDef, nkTemplateDef, nkLambda, nkDo, nkFuncDef:
+      discard
+    else:
+      for i in 0..<n.safeLen:
+        injectDefaultCalls(n[i], c)
 
 proc injectDestructorCalls*(g: ModuleGraph; idgen: IdGenerator; owner: PSym; n: PNode): PNode =
   when toDebug.len > 0:

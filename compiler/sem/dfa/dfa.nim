@@ -42,12 +42,14 @@ import std/private/asciitables
 
 type
   InstrKind* = enum
-    goto, fork, def, use
+    goto, fork, def, use, cachew, cacher
   Instr* = object
-    n*: PNode # contains the def/use location.
     case kind*: InstrKind
-    of goto, fork: dest*: int
-    else: discard
+    of goto, fork, cachew, cacher:
+      dest*: int
+    of use, def:
+      n*: PNode # contains the def/use location.
+
 
   ControlFlowGraph* = seq[Instr]
 
@@ -88,8 +90,15 @@ proc codeListing(c: ControlFlowGraph, start = 0; last = -1): string =
     of goto, fork:
       result.add "L"
       result.addInt c[i].dest+i
+    of cachew:
+      result.add "W"
+      result.addInt c[i].dest+i
+    of cacher:
+      result.add "R"
+      result.addInt c[i].dest+i
     result.add("\t#")
-    result.add($c[i].n.info.line)
+    if c[i].kind in {def, use}:
+      result.add($c[i].n.info.line)
     result.add("\n")
     inc i
   if i in jumpTargets: result.add("L" & $i & ": End\n")
@@ -98,13 +107,17 @@ proc echoCfg*(c: ControlFlowGraph; start = 0; last = -1) {.deprecated.} =
   ## echos the ControlFlowGraph for debugging purposes.
   echo codeListing(c, start, last).alignTable
 
-proc forkI(c: var Con; n: PNode): TPosition =
+proc forkI(c: var Con): TPosition =
   result = TPosition(c.code.len)
-  c.code.add Instr(n: n, kind: fork, dest: 0)
+  c.code.add Instr(kind: fork, dest: 0)
 
-proc gotoI(c: var Con; n: PNode): TPosition =
+proc gotoI(c: var Con): TPosition =
   result = TPosition(c.code.len)
-  c.code.add Instr(n: n, kind: goto, dest: 0)
+  c.code.add Instr(kind: goto, dest: 0)
+
+proc cachewI(c: var Con): TPosition =
+  result = TPosition(c.code.len)
+  c.code.add Instr(kind: cachew, dest: 0)
 
 ##[
 
@@ -292,7 +305,7 @@ template checkedDistance(dist): int =
   dist
 
 proc jmpBack(c: var Con, n: PNode, p = TPosition(0)) =
-  c.code.add Instr(n: n, kind: goto, dest: checkedDistance(p.int - c.code.len))
+  c.code.add Instr(kind: goto, dest: checkedDistance(p.int - c.code.len))
 
 proc patch(c: var Con, p: TPosition) =
   # patch with current index
@@ -302,12 +315,12 @@ proc gen(c: var Con; n: PNode)
 
 proc popBlock(c: var Con; oldLen: int) =
   var exits: seq[TPosition]
-  exits.add c.gotoI(newNode(nkEmpty))
+  exits.add c.gotoI()
   for f in c.blocks[oldLen].breakFixups:
     c.patch(f[0])
     for finale in f[1]:
       c.gen(finale)
-    exits.add c.gotoI(newNode(nkEmpty))
+    exits.add c.gotoI()
   for e in exits:
     c.patch e
   c.blocks.setLen(oldLen)
@@ -376,12 +389,17 @@ when true:
     else:
       withBlock(nil):
         var endings: array[2, TPosition]
-        for i in 0..1:
-          c.gen(n[0])
-          endings[i] = c.forkI(n)
-          c.gen(n[1])
-        for i in countdown(endings.high, 0):
-          c.patch(endings[i])
+        c.gen(n[0])
+        endings[0] = c.forkI()
+        let firstCache = c.cachewI()
+        c.gen(n[1])
+        c.patch(firstCache)
+        c.gen(n[0])
+        endings[1] = c.forkI()
+        c.code.add Instr(kind: cacher, dest: int firstCache)
+        c.gen(n[1]) # Remove this
+        c.patch(endings[1])
+        c.patch(endings[0])
 
 else:
   proc genWhile(c: var Con; n: PNode) =
@@ -395,15 +413,15 @@ else:
     withBlock(nil):
       if isTrue(n[0]):
         c.gen(n[1])
-        c.jmpBack(n, lab1)
+        c.jmpBack(lab1)
       else:
         c.gen(n[0])
         forkT(n):
           c.gen(n[1])
-          c.jmpBack(n, lab1)
+          c.jmpBack(lab1)
 
 template forkT(n, body) =
-  let lab1 = c.forkI(n)
+  let lab1 = c.forkI()
   body
   c.patch(lab1)
 
@@ -451,7 +469,7 @@ proc genIf(c: var Con, n: PNode) =
     if it.len == 2:
       forkT(it[1]):
         c.gen(it[1])
-        endings.add c.gotoI(it[1])
+        endings.add c.gotoI()
   for i in countdown(endings.high, 0):
     c.patch(endings[i])
 
@@ -497,14 +515,14 @@ proc genCase(c: var Con; n: PNode) =
         c.gen(it.lastSon)
         if endings.len != 0:
           c.patch(endings[^1])
-        endings.add c.gotoI(it.lastSon)
+        endings.add c.gotoI()
 
 proc genBlock(c: var Con; n: PNode) =
   withBlock(n[0].sym):
     c.gen(n[1])
 
 proc genBreakOrRaiseAux(c: var Con, i: int, n: PNode) =
-  let lab1 = c.gotoI(n)
+  let lab1 = c.gotoI()
   if c.blocks[i].isTryBlock:
     c.blocks[i].raiseFixups.add lab1
   else:
@@ -549,7 +567,7 @@ proc genTry(c: var Con; n: PNode) =
     if it.kind != nkFinally:
       forkT(it):
         c.gen(it.lastSon)
-        endings.add c.gotoI(it)
+        endings.add c.gotoI()
   for i in countdown(endings.high, 0):
     c.patch(endings[i])
 
@@ -557,9 +575,9 @@ proc genTry(c: var Con; n: PNode) =
   if fin.kind == nkFinally:
     c.gen(fin[0])
 
-template genNoReturn(c: var Con; n: PNode) =
+template genNoReturn(c: var Con) =
   # leave the graph
-  c.code.add Instr(n: n, kind: goto, dest: high(int) - c.code.len)
+  c.code.add Instr(kind: goto, dest: high(int) - c.code.len)
 
 proc genRaise(c: var Con; n: PNode) =
   gen(c, n[0])
@@ -570,7 +588,7 @@ proc genRaise(c: var Con; n: PNode) =
         return
     assert false #Unreachable
   else:
-    genNoReturn(c, n)
+    genNoReturn(c)
 
 proc genImplicitReturn(c: var Con) =
   if c.owner.kind in {skProc, skFunc, skMethod, skIterator, skConverter} and resultPos < c.owner.ast.len:
@@ -707,7 +725,7 @@ proc gen(c: var Con; n: PNode) =
       else:
         genCall(c, n)
       if sfNoReturn in n[0].sym.flags:
-        genNoReturn(c, n)
+        genNoReturn(c)
     else:
       genCall(c, n)
   of nkCharLit..nkNilLit: discard

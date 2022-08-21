@@ -46,9 +46,6 @@ import
     nilcheck,
   ]
 
-when defined(useDfa):
-  import dfa
-
 import liftdestructors
 include sinkparameter_inference
 
@@ -1574,11 +1571,6 @@ proc trackProc*(c: PContext; s: PSym, body: PNode) =
       kind: rsemLockLevelMismatch,
       lockMismatch: ($s.typ.lockLevel, $t.maxLockLevel)))
 
-  when defined(useDfa):
-    if s.name.s == "testp":
-      dataflowAnalysis(s, body)
-
-      when false: trackWrites(s, body)
   if strictNotNil in c.features and s.kind == skProc:
     # HACK I don't know why there are two different configurations anyway,
     # but without mixing in `c.features` `checkNil` cannot know if nil
