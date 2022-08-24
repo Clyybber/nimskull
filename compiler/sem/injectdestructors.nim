@@ -39,7 +39,7 @@ import
     options
   ],
   compiler/sem/[
-    dfa/dfa,
+    dfa/cfg,
     dfa/dfa_analysis,
     lowerings,
     parampatterns,

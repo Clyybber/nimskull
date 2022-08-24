@@ -18,7 +18,7 @@ import
     msgs,
     options
   ],
-  compiler/sem/dfa/dfa
+  compiler/sem/dfa/cfg
 
 const toDebug* {.strdefine.} = ""
 when toDebug.len > 0:
@@ -120,129 +120,131 @@ obj          field       alias kind
     else: assert false # unreachable
 
 include compiler/sem/dfa/hierarchical_set
-include compiler/sem/dfa/taint_tree
 
-type
-  PathCache = object
-    # This captures the effect a section
-    # of cfg code has, with a single start and exit
-    lastReads: HierarchicalSet
-      # All last reads this section added internally,
-      # that means not last reads that occured before
-      # this section and were made last reads because
-      # of a write in this section
-    potentialLastReads: HierarchicalSet
-      # All potential last reads this section added
-      # internally, that means not potential last reads
-      # that occured before this section,
-      # and survived in this section
-    notLastReads: HierarchicalSet
-      # All uses that are definitely not last reads,
-      # internal and external to this section
-    hull: TaintTree
-      # This contains all locations that this section
-      # would turn into external last reads
-      # Only this set probably needs to be hierarchical
-      # This could also be all locations that this section
-      # would not turn into external last reads
-      #  -> time
-      # s   w
-      # s.x  r
-      # s.y   r
-      # v   r
-      # v.x  w
-      # v.y   r
-      # t.x w
-      # t.y  r
-      # t     w
-      # u.x r
-      # u.y  w
-      # u     r
-      # r.x w
-      # r.y  w
-      # r     r
-      # w.x r
-      # w.y  r
-      # w     w
-      # ===
-      # hull(writes):
-      # w(s) + w(t.x) + w(u.y) + w(r.x) + w(r.y) + ~w(w-w.x-w.y)~
-      # which will turn into last reads:
-      # s      t.x      u.y      r.x      r.y      XXX: Same issue as below  
-      # s.x                        \___r__/
-      # s.y
-      # vs
-      # hull(reads)
-      # r(v) (+ r(v.y)) + r(t.y) + r(u.x) + ~r(r-r.x-r.y)~
-      # XXX: r-r.x-r.y is empty or not?
-      #   In r(r.x) r(r.y) w(r) nothing will be sinked
-      #   currently. For it to be we'd need type info.
-      #   And then also handle ref objects and shit.
-      # Regarding the XXX it makes sense to make reads or writes occuring before
-      # reads or writes of their parents exclude those from the hull. This is consistent
-      # with not doing the above (which needs typeinfo and shit)
-      # What about locations not touched at all by this section?
-      # -> We need both a write and read hull
-      # lastReads.add potentialLastReads.exclDefinitelyAliased(hull(writes))
-      # notLastReads.add potentialLastReads.exclMaybeAliasing(hull(writes))
-      # notLastReads.add potentialLastReads.exclMaybeAliased(hull(read))
-      # notLastReads.add potentialLastReads.exclMaybeAliasing(hull(read))
-      # XXX: But if in the hull childs exclude parents then the hulls can together
-      # add up to less than all touched locations
-      # -> Keep write hull and hull of everything touched
-      # XXX: Hull doesn't mean definitelyAliased, it also goes "up", via maybeAliasing
+when false: # disabled for now
+  include compiler/sem/dfa/taint_tree
 
-  Cache = object
-    exits: Table[int, PathCache]
-    start: int
-    stop: int
+  type
+    PathCache = object
+      # This captures the effect a section
+      # of cfg code has, with a single start and exit
+      lastReads: HierarchicalSet
+        # All last reads this section added internally,
+        # that means not last reads that occured before
+        # this section and were made last reads because
+        # of a write in this section
+      potentialLastReads: HierarchicalSet
+        # All potential last reads this section added
+        # internally, that means not potential last reads
+        # that occured before this section,
+        # and survived in this section
+      notLastReads: HierarchicalSet
+        # All uses that are definitely not last reads,
+        # internal and external to this section
+      hull: TaintTree
+        # This contains all locations that this section
+        # would turn into external last reads
+        # Only this set probably needs to be hierarchical
+        # This could also be all locations that this section
+        # would not turn into external last reads
+        #  -> time
+        # s   w
+        # s.x  r
+        # s.y   r
+        # v   r
+        # v.x  w
+        # v.y   r
+        # t.x w
+        # t.y  r
+        # t     w
+        # u.x r
+        # u.y  w
+        # u     r
+        # r.x w
+        # r.y  w
+        # r     r
+        # w.x r
+        # w.y  r
+        # w     w
+        # ===
+        # hull(writes):
+        # w(s) + w(t.x) + w(u.y) + w(r.x) + w(r.y) + ~w(w-w.x-w.y)~
+        # which will turn into last reads:
+        # s      t.x      u.y      r.x      r.y      XXX: Same issue as below  
+        # s.x                        \___r__/
+        # s.y
+        # vs
+        # hull(reads)
+        # r(v) (+ r(v.y)) + r(t.y) + r(u.x) + ~r(r-r.x-r.y)~
+        # XXX: r-r.x-r.y is empty or not?
+        #   In r(r.x) r(r.y) w(r) nothing will be sinked
+        #   currently. For it to be we'd need type info.
+        #   And then also handle ref objects and shit.
+        # Regarding the XXX it makes sense to make reads or writes occuring before
+        # reads or writes of their parents exclude those from the hull. This is consistent
+        # with not doing the above (which needs typeinfo and shit)
+        # What about locations not touched at all by this section?
+        # -> We need both a write and read hull
+        # lastReads.add potentialLastReads.exclDefinitelyAliased(hull(writes))
+        # notLastReads.add potentialLastReads.exclMaybeAliasing(hull(writes))
+        # notLastReads.add potentialLastReads.exclMaybeAliased(hull(read))
+        # notLastReads.add potentialLastReads.exclMaybeAliasing(hull(read))
+        # XXX: But if in the hull childs exclude parents then the hulls can together
+        # add up to less than all touched locations
+        # -> Keep write hull and hull of everything touched
+        # XXX: Hull doesn't mean definitelyAliased, it also goes "up", via maybeAliasing
 
-proc debugTaints(cfg: ControlFlowGraph, start = 0, stop = cfg.len) =
-  type State = ref object
-    taintTree: TaintTree
+    Cache = object
+      exits: Table[int, PathCache]
+      start: int
+      stop: int
 
-  func mergeStates(cfg: ControlFlowGraph, a: var State, b: sink State) =
-    if a == nil:
-      a = b
-    else:
-      cfg.mergeTaintTrees a.taintTree, b.taintTree
+  proc debugTaints(cfg: ControlFlowGraph, start = 0, stop = cfg.len) =
+    type State = ref object
+      taintTree: TaintTree
 
-  var states = newSeq[State](cfg.len + 1)
-  states[start] = State(taintTree: TaintTree(readRoot: TaintNode(), writeRoot: TaintNode()))
+    func mergeStates(cfg: ControlFlowGraph, a: var State, b: sink State) =
+      if a == nil:
+        a = b
+      else:
+        cfg.mergeTaintTrees a.taintTree, b.taintTree
 
-  for pc in start..<stop:
-    template state: State = states[pc]
-    if state != nil:
-      dbg:
-        echo "pc:",pc
-        echo "taintTree:", $state.taintTree
-      case cfg[pc].kind
-      of def:
-        state.taintTree.taintWrite cfg[pc].n
+    var states = newSeq[State](cfg.len + 1)
+    states[start] = State(taintTree: TaintTree(readRoot: TaintNode(), writeRoot: TaintNode()))
 
-        cfg.mergeStates(states[pc + 1], move(states[pc]))
-      of use:
-        state.taintTree.taintRead cfg[pc].n
+    for pc in start..<stop:
+      template state: State = states[pc]
+      if state != nil:
+        dbg:
+          echo "pc:",pc
+          echo "taintTree:", $state.taintTree
+        case cfg[pc].kind
+        of def:
+          state.taintTree.taintWrite cfg[pc].n
 
-        cfg.mergeStates(states[pc + 1], move(states[pc]))
-      of goto:
-        cfg.mergeStates(states[pc + cfg[pc].dest], move(states[pc]))
-      of fork:
-        var copy = State(
-          taintTree: copy(state.taintTree)
-        )
+          cfg.mergeStates(states[pc + 1], move(states[pc]))
+        of use:
+          state.taintTree.taintRead cfg[pc].n
 
-        cfg.mergeStates(states[pc + cfg[pc].dest], copy)
-        cfg.mergeStates(states[pc + 1], move(states[pc]))
-      of cachew, cacher:
-        discard # Not handled
+          cfg.mergeStates(states[pc + 1], move(states[pc]))
+        of goto:
+          cfg.mergeStates(states[pc + cfg[pc].dest], move(states[pc]))
+        of fork:
+          var copy = State(
+            taintTree: copy(state.taintTree)
+          )
 
-func applyTaintTree(cfg: ControlFlowGraph, s: var HierarchicalSet, t: TaintTree):
-  tuple[lastReads, notLastReads: HierarchicalSet] =
+          cfg.mergeStates(states[pc + cfg[pc].dest], copy)
+          cfg.mergeStates(states[pc + 1], move(states[pc]))
+        of cachew, cacher: # Skip; not handled
+          cfg.mergeStates(states[pc + 1], move(states[pc]))
 
-  proc applyTaintTreeAux(cfg: ControlFlowGraph, writeNode, readNode: TaintNode) =
-    if writeNode.taint:
-      discard
+  func applyTaintTree(cfg: ControlFlowGraph, s: var HierarchicalSet, t: TaintTree):
+    tuple[lastReads, notLastReads: HierarchicalSet] =
+
+    proc applyTaintTreeAux(cfg: ControlFlowGraph, writeNode, readNode: TaintNode) =
+      if writeNode.taint:
+        discard
 
 proc computeLastReads(cfg: ControlFlowGraph) =
 
@@ -251,32 +253,33 @@ proc computeLastReads(cfg: ControlFlowGraph) =
     potentialLastReads: HierarchicalSet
     notLastReads: HierarchicalSet
 
-  func applyPathCache(cfg: ControlFlowGraph, a: var State, c: PathCache) =
-    if a == nil:
-      a = State(
-        lastReads: HierarchicalSet(root: Node()),
-        potentialLastReads: HierarchicalSet(root: Node()),
-        notLastReads: HierarchicalSet(root: Node()),
-      )
-    else:
-      let (lastReads, notLastReads) = cfg.applyTaintTree(a.potentialLastReads, c.hull)
-        # Modifies potentialLastReads already, no need to do that ourselves
+  when false:
+    func applyPathCache(cfg: ControlFlowGraph, a: var State, c: PathCache) =
+      if a == nil:
+        a = State(
+          lastReads: HierarchicalSet(root: Node(kind: Object)),
+          potentialLastReads: HierarchicalSet(root: Node(kind: Object)),
+          notLastReads: HierarchicalSet(root: Node(kind: Object)),
+        )
+      else:
+        let (lastReads, notLastReads) = cfg.applyTaintTree(a.potentialLastReads, c.hull)
+          # Modifies potentialLastReads already, no need to do that ourselves
 
-      a.lastReads.incl lastReads # TaintTree
-      a.notLastReads.incl notLastReads # TaintTree
+        a.lastReads.incl lastReads # TaintTree
+        a.notLastReads.incl notLastReads # TaintTree
 
-      a.lastReads.incl c.lastReads
+        a.lastReads.incl c.lastReads
 
-      a.potentialLastReads.incl c.potentialLastReads
-      a.potentialLastReads.excl a.notLastReads # Is this unneccessary?
-      a.potentialLastReads.excl c.notLastReads # it helps performance
+        a.potentialLastReads.incl c.potentialLastReads
+        a.potentialLastReads.excl a.notLastReads # Is this unneccessary?
+        a.potentialLastReads.excl c.notLastReads # it helps performance
 
-      a.notLastReads.incl c.notLastReads
+        a.notLastReads.incl c.notLastReads
 
-      # And if it is neccessary, then why not do
-      # a.notLastReads.incl c.notLastReads
-      # a.potentialLastReads.excl a.notLastReads
-      # instead
+        # And if it is neccessary, then why not do
+        # a.notLastReads.incl c.notLastReads
+        # a.potentialLastReads.excl a.notLastReads
+        # instead
 
   func mergeStates(cfg: ControlFlowGraph, a: var State, b: sink State) =
     # Inplace for performance:
@@ -297,12 +300,13 @@ proc computeLastReads(cfg: ControlFlowGraph) =
 
   var states = newSeq[State](cfg.len + 1)
   states[0] = State(
-    lastReads: HierarchicalSet(root: Node()),
-    potentialLastReads: HierarchicalSet(root: Node()),
-    notLastReads: HierarchicalSet(root: Node()),
+    lastReads: HierarchicalSet(root: Node(kind: Object)),
+    potentialLastReads: HierarchicalSet(root: Node(kind: Object)),
+    notLastReads: HierarchicalSet(root: Node(kind: Object)),
   )
 
-  var caches: seq[Cache]
+  when false:
+    var caches: seq[Cache]
 
   for pc in 0..<cfg.len:
     template state: State = states[pc]
@@ -337,6 +341,10 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         for i in toIntSet(notLastReads):
           cfg[i].n.comment = '\n' & $pc
 
+        # discard debugA state.potentialLastReads
+        # echo renderTree cfg[pc].n
+        # echo reprNodeKeys nodeToPath cfg[pc].n
+        # echo len nodeToPath cfg[pc].n
         state.potentialLastReads.incl(cfg[pc].n, pc)
 
         cfg.mergeStates(states[pc + 1], move(states[pc]))
@@ -351,8 +359,8 @@ proc computeLastReads(cfg: ControlFlowGraph) =
 
         cfg.mergeStates(states[pc + cfg[pc].dest], copy)
         cfg.mergeStates(states[pc + 1], move(states[pc]))
-      of cachew, cacher:
-        discard # TODO
+      of cachew, cacher: # TODO
+        cfg.mergeStates(states[pc + 1], move(states[pc]))
 
   let lastReads = (states[^1].lastReads.toIntSet + states[^1].potentialLastReads.toIntSet) -
                    states[^1].notLastReads.toIntSet
@@ -390,8 +398,6 @@ proc computeFirstWrites(cfg: ControlFlowGraph) =
   var states = newSeq[State](cfg.len + 1)
   states[0] = State()
 
-  var caches: seq[Cache]
-
   for pc in 0..<cfg.len:
     template state: State = states[pc]
     if state != nil:
@@ -424,8 +430,8 @@ proc computeFirstWrites(cfg: ControlFlowGraph) =
 
         cfg.mergeStates(states[pc + cfg[pc].dest], copy)
         cfg.mergeStates(states[pc + 1], move(states[pc]))
-      of cachew, cacher:
-        discard # NYI
+      of cachew, cacher: # NYI
+        cfg.mergeStates(states[pc + 1], move(states[pc]))
 
 proc isLastRead*(n: PNode): bool =
   let m = skipConvDfa(n)
@@ -446,8 +452,9 @@ proc computeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
   preprocessCfg(cfg)
   computeLastReads(cfg)
   computeFirstWrites(cfg)
-  dbg:
-    debugTaints(cfg)
+  when false:
+    dbg:
+      debugTaints(cfg)
 
 when false:
   proc initialized*(code: ControlFlowGraph; pc: int,

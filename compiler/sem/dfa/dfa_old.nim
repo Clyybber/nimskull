@@ -1,11 +1,11 @@
 type
-  OLDState = ref object
+  State = ref object
     lastReads: IntSet
     potentialLastReads: IntSet
     notLastReads: IntSet
     alreadySeen: HashSet[PNode]
 
-proc oLDmergeStates(a: var OLDState, b: sink OLDState) =
+proc mergeStates(a: var State, b: sink State) =
   # Inplace for performance:
   #   lastReads = a.lastReads + b.lastReads
   #   potentialLastReads = (a.potentialLastReads + b.potentialLastReads) - (a.notLastReads + b.notLastReads)
@@ -22,7 +22,7 @@ proc oLDmergeStates(a: var OLDState, b: sink OLDState) =
     a.notLastReads.incl b.notLastReads
     a.alreadySeen.incl b.alreadySeen
 
-proc oLDcomputeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
+proc computeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
   var cache = initTable[(PNode, PNode), AliasKind]()
   template aliasesCached(obj, field: PNode): AliasKind =
     aliasesCached(cache, obj, field)
@@ -30,11 +30,11 @@ proc oLDcomputeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
   var cfg = cfg
   preprocessCfg(cfg)
 
-  var states = newSeq[OLDState](cfg.len + 1)
-  states[0] = OLDState()
+  var states = newSeq[State](cfg.len + 1)
+  states[0] = State()
 
   for pc in 0..<cfg.len:
-    template state: OLDState = states[pc]
+    template state: State = states[pc]
     if state != nil:
       dbg:
         echo "pc:",pc
@@ -65,7 +65,7 @@ proc oLDcomputeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
 
         state.alreadySeen.incl cfg[pc].n
 
-        oLDmergeStates(states[pc + 1], move(states[pc]))
+        mergeStates(states[pc + 1], move(states[pc]))
       of use:
         var potentialLastReadsCopy = state.potentialLastReads
         for r in potentialLastReadsCopy:
@@ -78,14 +78,14 @@ proc oLDcomputeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
 
         state.alreadySeen.incl cfg[pc].n
 
-        oLDmergeStates(states[pc + 1], move(states[pc]))
+        mergeStates(states[pc + 1], move(states[pc]))
       of goto:
-        oLDmergeStates(states[pc + cfg[pc].dest], move(states[pc]))
+        mergeStates(states[pc + cfg[pc].dest], move(states[pc]))
       of fork:
-        var copy = OLDState()
+        var copy = State()
         copy[] = states[pc][]
-        oLDmergeStates(states[pc + cfg[pc].dest], copy)
-        oLDmergeStates(states[pc + 1], move(states[pc]))
+        mergeStates(states[pc + cfg[pc].dest], copy)
+        mergeStates(states[pc + 1], move(states[pc]))
 
   let lastReads = (states[^1].lastReads + states[^1].potentialLastReads) - states[^1].notLastReads
   var lastReadTable: Table[PNode, seq[int]]
