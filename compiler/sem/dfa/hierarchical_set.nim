@@ -30,7 +30,13 @@ type
     case kind: NodeKind
     of Leaf:
       discard
-    of RefPtr:
+    of RefPtr, OwnedPtr:
+      # Locations pointed to by a RefPtr are generally not owned, not even
+      # when their parents are owned by us, e.g. sinkparams or ourVars.
+      # (Deeper analysis of the control flow/data flow could identify
+      #  ourVar RefPtrs that are effectifely owned)
+      # OwnedPtrs (Unique pointers) OTOH are owned by us when we own their parents.
+      # The pointer indirection in sequences is one such OwnedPtr.
       target: Node
     of Object:
       allFields: HashSet[NodeKey]
@@ -45,13 +51,19 @@ type
 
 import compiler/utils/astrepr
 
-proc typeToKind(n: PNode): NodeKind = # Should take PType instead
+proc hash(n: PNode): Hash = hash(cast[pointer](n))
+
+proc hash(s: PSym): Hash = hash(cast[pointer](s))
+
+proc typeOfNode(n: PNode): PType =
   const skipped = {tyAlias, tyDistinct, tyGenericInst,
     tyRef, tyPtr, tyVar, tySink, tyLent, tyOwned}
-  var typ = n.typ.skipTypes(skipped)
+  result = n.typ.skipTypes(skipped)
   # HACK: sometimes typ is tyUntyped, in that case we try to get the sym typ instead
-  if typ.kind == tyUntyped and n.kind == nkSym:
-    typ = n.sym.typ.skipTypes(skipped)
+  if result.kind == tyUntyped and n.kind == nkSym:
+    result = n.sym.typ.skipTypes(skipped)
+
+proc typeToKind(typ: PType): NodeKind =
   case typ.kind
   of tyObject, tyTuple:
     result = Object
@@ -66,14 +78,33 @@ proc typeToKind(n: PNode): NodeKind = # Should take PType instead
     result = Leaf
   else:
     #debug typ
-    debug n
     debug typ
     doAssert false, $typ.kind
 
-proc hash(n: PNode): Hash = hash(cast[pointer](n))
+let
+  seqLen = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
+  seqPtr = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
+  seqCap = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
+  seqData = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
 
-proc hash(s: PSym): Hash = hash(cast[pointer](s))
-
+proc nodeToNode(n: PNode): Node =
+  let typ = typeOfNode(n)
+  case typ.kind
+  # of tySequence:
+  #   {.cast(noSideEffect).}:
+  #     result = Node(kind: Object, fields: {
+  #         seqLen: Node(kind: Leaf),
+  #         seqPtr: Node(kind: OwnedPtr, target:
+  #           Node(kind: Object, fields: {
+  #             seqCap: Node(kind: Leaf),
+  #             seqData: Node(kind: Infinite)
+  #           }.toTable)
+  #         )
+  #       }.toTable)
+  else:
+    result = Node(kind: typeToKind(typ))
+  #case result.kind == Object: # set bounds/fields
+    
 from sequtils import toSeq
 
 func collectImportantNodes(n: PNode): seq[PNode] =
@@ -103,7 +134,7 @@ func nodeToPath(n: PNode): seq[NodeKey] =
       doAssert n[1].kind == nkSym
       result.add NodeKey(kind: field, field: n[1].sym)
     of nkBracketExpr:
-      if typeToKind(n[0]) == Object: # Indexing a tuple
+      if typeOfNode(n[0]).kind == tyTuple: # Indexing a tuple
         {.cast(noSideEffect).}:
           # hack because sem doesn't transform tup[X] to tup.field_X
           if fakeTupleIndexSyms.len < n[1].intVal + 1:
@@ -189,13 +220,11 @@ func incl(hs: var HierarchicalSet, loc: PNode, instr: int) =
     let nodeKey = path[i]
     case nodeKey.kind
     of field:
-      #CONTINUE: typeToKind invocation needs to be passed the appropriate parts of the whole
-      #expression to type the whole path/subtree leading to the loc leaf
-      lastRef = lastRef.fields.mgetOrPut(nodeKey.field, Node(kind: typeToKind(parts[^(i+1)]))) #XXX
+      lastRef = lastRef.fields.mgetOrPut(nodeKey.field, nodeToNode(parts[^(i+1)]))
     of constant:
-      lastRef = lastRef.constants.mgetOrPut(nodeKey.constant, Node(kind: typeToKind(parts[^(i+1)]))) #XXX
+      lastRef = lastRef.constants.mgetOrPut(nodeKey.constant, nodeToNode(parts[^(i+1)]))
     of variable:
-      lastRef = lastRef.variables.mgetOrPut(nodeKey.variable, Node(kind: typeToKind(parts[^(i+1)]))) #XXX
+      lastRef = lastRef.variables.mgetOrPut(nodeKey.variable, nodeToNode(parts[^(i+1)]))
 
   lastRef.instructions.incl instr
 
@@ -263,29 +292,45 @@ func incl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
 
 
 func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
-  func excl(a: Node, b: Node) =
+  func excl(a: Node, b: Node): bool =
+    result = true
     a.instructions.excl b.instructions
-    # if a.instructions.len == 0:
-    #   #if a.childrenLen == 0: XXX: cleanup
+    if a.instructions.len > 0: result = false
 
     case a.kind:
     of Object:
+      var toClean: seq[PSym]
       for k, child in a.fields:
         if k in b.fields:
-          excl(child, b.fields[k])
+          if excl(child, b.fields[k]):
+            toClean.add k
+      for k in toClean: a.fields.del k
+
+      if a.fields.len > 0: result = false
 
     of Array, Infinite:
-      for k, child in a.constants:
-        if k in b.constants:
-          excl(child, b.constants[k])
+      block:
+        var toClean: seq[BiggestInt]
+        for k, child in a.constants:
+          if k in b.constants:
+            if excl(child, b.constants[k]):
+              toClean.add k
+        for k in toClean: a.constants.del k
 
-      for k, child in a.variables:
-        if k in b.variables:
-          excl(child, b.variables[k])
+      block:
+        var toClean: seq[PSym]
+        for k, child in a.variables:
+          if k in b.variables:
+            if excl(child, b.variables[k]):
+              toClean.add k
+        for k in toClean: a.variables.del k
+
+      if a.constants.len > 0: result = false
+      if a.variables.len > 0: result = false
 
     of Leaf, RefPtr: discard
 
-  excl(hs.root, b.root)
+  discard excl(hs.root, b.root)
 
 
 func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
