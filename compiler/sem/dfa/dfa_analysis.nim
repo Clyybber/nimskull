@@ -121,7 +121,7 @@ obj          field       alias kind
 
 include compiler/sem/dfa/hierarchical_set
 
-when false: # disabled for now
+when true: # disabled for now
   include compiler/sem/dfa/taint_tree
 
   type
@@ -452,9 +452,8 @@ proc computeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
   preprocessCfg(cfg)
   computeLastReads(cfg)
   computeFirstWrites(cfg)
-  when false:
-    dbg:
-      debugTaints(cfg)
+  dbg:
+    debugTaints(cfg)
 
 when false:
   proc initialized*(code: ControlFlowGraph; pc: int,

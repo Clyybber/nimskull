@@ -23,9 +23,9 @@ type
   TaintNode = ref object
     taint: bool # read: false: implicitly read, true: explicitly read
                 # write: false: not written before read, true: written before read
-    symChildren: Table[NodeKey, TaintNode]
-    constantChildren: Table[NodeKey, TaintNode]
-    variableChildren: TaintNode
+    fields: Table[NodeKey, TaintNode]
+    constants: Table[NodeKey, TaintNode]
+    variables: TaintNode
       # Only one node for now, change back to Table[NodeKey, TaintNode]
       # if smarter variable analysis is implemented
       # Smarter variable analysis could simply assign
@@ -45,7 +45,7 @@ type
     readRoot: TaintNode
 
 func taintRead(hs: var TaintTree, loc: PNode) =
-  let path = nodeToPath(loc)
+  let path = nodesToPath(collectImportantNodes(loc))
 
   # First check if dominated by write
   var writeLastRef = hs.writeRoot
@@ -55,17 +55,17 @@ func taintRead(hs: var TaintTree, loc: PNode) =
 
     let nodeKey = path[i]
     case nodeKey.kind
-    of sym:
-      if nodeKey in writeLastRef.symChildren:
-        writeLastRef = writeLastRef.symChildren[nodeKey]
+    of field:
+      if nodeKey in writeLastRef.fields:
+        writeLastRef = writeLastRef.fields[nodeKey]
       else: break
     of constant:
-      if nodeKey in writeLastRef.constantChildren:
-        writeLastRef = writeLastRef.constantChildren[nodeKey]
+      if nodeKey in writeLastRef.constants:
+        writeLastRef = writeLastRef.constants[nodeKey]
       else: break
     of variable:
-      if writeLastRef.variableChildren != nil:
-        writeLastRef = writeLastRef.variableChildren
+      if writeLastRef.variables != nil:
+        writeLastRef = writeLastRef.variables
       else: break
 
   var readLastRef = hs.readRoot
@@ -75,18 +75,18 @@ func taintRead(hs: var TaintTree, loc: PNode) =
 
     let nodeKey = path[i]
     case nodeKey.kind
-    of sym:
-      if nodeKey notin readLastRef.symChildren:
-        readLastRef.symChildren[nodeKey] = TaintNode()
-      readLastRef = readLastRef.symChildren[nodeKey]
+    of field:
+      if nodeKey notin readLastRef.fields:
+        readLastRef.fields[nodeKey] = TaintNode()
+      readLastRef = readLastRef.fields[nodeKey]
     of constant:
-      if nodeKey notin readLastRef.constantChildren:
-        readLastRef.constantChildren[nodeKey] = TaintNode()
-      readLastRef = readLastRef.constantChildren[nodeKey]
+      if nodeKey notin readLastRef.constants:
+        readLastRef.constants[nodeKey] = TaintNode()
+      readLastRef = readLastRef.constants[nodeKey]
     of variable:
-      if readLastRef.variableChildren == nil:
-        readLastRef.variableChildren = TaintNode()
-      readLastRef = readLastRef.variableChildren
+      if readLastRef.variables == nil:
+        readLastRef.variables = TaintNode()
+      readLastRef = readLastRef.variables
 
   readLastRef.taint = true
   # The following turns (read: true, write: true) into (read: true, write: false)
@@ -97,7 +97,7 @@ func taintRead(hs: var TaintTree, loc: PNode) =
   #   writeLastRef.taint = false
 
 func taintWrite(hs: var TaintTree, loc: PNode) =
-  let path = nodeToPath(loc)
+  let path = nodesToPath(collectImportantNodes(loc))
 
   # First check if dominated by read
   var readLastRef = hs.readRoot
@@ -107,17 +107,17 @@ func taintWrite(hs: var TaintTree, loc: PNode) =
 
     let nodeKey = path[i]
     case nodeKey.kind
-    of sym:
-      if nodeKey in readLastRef.symChildren:
-        readLastRef = readLastRef.symChildren[nodeKey]
+    of field:
+      if nodeKey in readLastRef.fields:
+        readLastRef = readLastRef.fields[nodeKey]
       else: readLastRef = nil; break
     of constant:
-      if nodeKey in readLastRef.constantChildren:
-        readLastRef = readLastRef.constantChildren[nodeKey]
+      if nodeKey in readLastRef.constants:
+        readLastRef = readLastRef.constants[nodeKey]
       else: readLastRef = nil; break
     of variable:
-      if readLastRef.variableChildren != nil:
-        readLastRef = readLastRef.variableChildren
+      if readLastRef.variables != nil:
+        readLastRef = readLastRef.variables
       else: readLastRef = nil; break
 
   var writeLastRef = hs.writeRoot
@@ -127,24 +127,24 @@ func taintWrite(hs: var TaintTree, loc: PNode) =
 
     let nodeKey = path[i]
     case nodeKey.kind
-    of sym:
-      if nodeKey notin writeLastRef.symChildren:
-        writeLastRef.symChildren[nodeKey] = TaintNode()
-      writeLastRef = writeLastRef.symChildren[nodeKey]
+    of field:
+      if nodeKey notin writeLastRef.fields:
+        writeLastRef.fields[nodeKey] = TaintNode()
+      writeLastRef = writeLastRef.fields[nodeKey]
     of constant:
-      if nodeKey notin writeLastRef.constantChildren:
-        writeLastRef.constantChildren[nodeKey] = TaintNode()
-      writeLastRef = writeLastRef.constantChildren[nodeKey]
+      if nodeKey notin writeLastRef.constants:
+        writeLastRef.constants[nodeKey] = TaintNode()
+      writeLastRef = writeLastRef.constants[nodeKey]
     of variable:
-      if writeLastRef.variableChildren == nil:
-        writeLastRef.variableChildren = TaintNode()
-      writeLastRef = writeLastRef.variableChildren
+      if writeLastRef.variables == nil:
+        writeLastRef.variables = TaintNode()
+      writeLastRef = writeLastRef.variables
 
   if not(readLastRef != nil and readLastRef.taint): # read before write: nothing
     writeLastRef.taint = true
 
 func len(n: TaintNode): int =
-  n.symChildren.len + n.constantChildren.len + ord(n.variableChildren != nil)
+  n.fields.len + n.constants.len + ord(n.variables != nil)
 
 proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
   # merge
@@ -164,17 +164,17 @@ proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
 
       var allSyms, allConsts: HashSet[NodeKey]
       if readCursorA != nil:
-        allSyms.incl readCursorA.symChildren.keys.toSeq.toHashSet
-        allConsts.incl readCursorA.constantChildren.keys.toSeq.toHashSet
+        allSyms.incl readCursorA.fields.keys.toSeq.toHashSet
+        allConsts.incl readCursorA.constants.keys.toSeq.toHashSet
       if writeCursorA != nil:
-        allSyms.incl writeCursorA.symChildren.keys.toSeq.toHashSet
-        allConsts.incl writeCursorA.constantChildren.keys.toSeq.toHashSet
+        allSyms.incl writeCursorA.fields.keys.toSeq.toHashSet
+        allConsts.incl writeCursorA.constants.keys.toSeq.toHashSet
       if readCursorB != nil:
-        allSyms.incl readCursorB.symChildren.keys.toSeq.toHashSet
-        allConsts.incl readCursorB.constantChildren.keys.toSeq.toHashSet
+        allSyms.incl readCursorB.fields.keys.toSeq.toHashSet
+        allConsts.incl readCursorB.constants.keys.toSeq.toHashSet
       if writeCursorB != nil:
-        allSyms.incl writeCursorB.symChildren.keys.toSeq.toHashSet
-        allConsts.incl writeCursorB.constantChildren.keys.toSeq.toHashSet
+        allSyms.incl writeCursorB.fields.keys.toSeq.toHashSet
+        allConsts.incl writeCursorB.constants.keys.toSeq.toHashSet
 
       if readCursorB != nil: result.read = readCursorB
       if readCursorA != nil: result.read = readCursorA
@@ -183,52 +183,52 @@ proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
 
       for k in allSyms:
         let (read, write) = mergeTaintTreesAux(
-          if readCursorA != nil and readCursorA.symChildren.hasKey(k):
-            readCursorA.symChildren[k]
+          if readCursorA != nil and readCursorA.fields.hasKey(k):
+            readCursorA.fields[k]
           else: nil,
-          if writeCursorA != nil and writeCursorA.symChildren.hasKey(k):
-            writeCursorA.symChildren[k]
+          if writeCursorA != nil and writeCursorA.fields.hasKey(k):
+            writeCursorA.fields[k]
           else: nil,
-          if readCursorB != nil and readCursorB.symChildren.hasKey(k):
-            readCursorB.symChildren[k]
+          if readCursorB != nil and readCursorB.fields.hasKey(k):
+            readCursorB.fields[k]
           else: nil,
-          if writeCursorB != nil and writeCursorB.symChildren.hasKey(k):
-            writeCursorB.symChildren[k]
+          if writeCursorB != nil and writeCursorB.fields.hasKey(k):
+            writeCursorB.fields[k]
           else: nil)
         if read != nil:
-          result.read.symChildren[k] = read
+          result.read.fields[k] = read
         if write != nil:
-          result.write.symChildren[k] = write
+          result.write.fields[k] = write
 
       for k in allConsts:
         let (read, write) = mergeTaintTreesAux(
-          if readCursorA != nil and readCursorA.constantChildren.hasKey(k):
-            readCursorA.constantChildren[k]
+          if readCursorA != nil and readCursorA.constants.hasKey(k):
+            readCursorA.constants[k]
           else: nil,
-          if writeCursorA != nil and writeCursorA.constantChildren.hasKey(k):
-            writeCursorA.constantChildren[k]
+          if writeCursorA != nil and writeCursorA.constants.hasKey(k):
+            writeCursorA.constants[k]
           else: nil,
-          if readCursorB != nil and readCursorB.constantChildren.hasKey(k):
-            readCursorB.constantChildren[k]
+          if readCursorB != nil and readCursorB.constants.hasKey(k):
+            readCursorB.constants[k]
           else: nil,
-          if writeCursorB != nil and writeCursorB.constantChildren.hasKey(k):
-            writeCursorB.constantChildren[k]
+          if writeCursorB != nil and writeCursorB.constants.hasKey(k):
+            writeCursorB.constants[k]
           else: nil)
         if read != nil:
-          result.read.constantChildren[k] = read
+          result.read.constants[k] = read
         if write != nil:
-          result.write.constantChildren[k] = write
+          result.write.constants[k] = write
 
       block:
         let (read, write) = mergeTaintTreesAux(
-          if readCursorA != nil: readCursorA.variableChildren else: nil,
-          if writeCursorA != nil: writeCursorA.variableChildren else: nil,
-          if readCursorB != nil: readCursorB.variableChildren else: nil,
-          if writeCursorB != nil: writeCursorB.variableChildren else: nil)
+          if readCursorA != nil: readCursorA.variables else: nil,
+          if writeCursorA != nil: writeCursorA.variables else: nil,
+          if readCursorB != nil: readCursorB.variables else: nil,
+          if writeCursorB != nil: writeCursorB.variables else: nil)
         if read != nil:
-          result.read.variableChildren = read
+          result.read.variables = read
         if write != nil:
-          result.write.variableChildren = write
+          result.write.variables = write
 
       # reads merge quite simply:
       #if   readCursorA != nil and readCursorB == nil: #handled before the for loops
@@ -256,16 +256,16 @@ proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
 func copy(n: TaintNode): TaintNode =
   result = TaintNode(
     taint: n.taint,
-    symChildren: n.symChildren,
-    constantChildren: n.constantChildren,
-    variableChildren: n.variableChildren
+    fields: n.fields,
+    constants: n.constants,
+    variables: n.variables
   )
-  for child in result.symChildren.mvalues:
+  for child in result.fields.mvalues:
     child = copy(child)
-  for child in result.constantChildren.mvalues:
+  for child in result.constants.mvalues:
     child = copy(child)
-  if result.variableChildren != nil:
-    result.variableChildren = copy(result.variableChildren)
+  if result.variables != nil:
+    result.variables = copy(result.variables)
 
 func copy(t: TaintTree): TaintTree = TaintTree(readRoot: copy(t.readRoot), writeRoot: copy(t.writeRoot))
 
@@ -273,8 +273,8 @@ proc `$`(t: TaintTree): string =
   proc reprNodeKeys(keys: seq[NodeKey]): string =
     let k = keys[^1]
     case k.kind
-    of sym:
-      $k.sym
+    of field:
+      $k.field
     of constant:
       $k.constant
     of variable:
@@ -295,26 +295,26 @@ proc `$`(t: TaintTree): string =
 
       var allSyms, allConsts: HashSet[NodeKey]
       if r != nil:
-        allSyms.incl r.symChildren.keys.toSeq.toHashSet
-        allConsts.incl r.constantChildren.keys.toSeq.toHashSet
+        allSyms.incl r.fields.keys.toSeq.toHashSet
+        allConsts.incl r.constants.keys.toSeq.toHashSet
       if w != nil:
-        allSyms.incl w.symChildren.keys.toSeq.toHashSet
-        allConsts.incl w.constantChildren.keys.toSeq.toHashSet
+        allSyms.incl w.fields.keys.toSeq.toHashSet
+        allConsts.incl w.constants.keys.toSeq.toHashSet
 
       for k in allSyms:
         result.add debugNode(key & k,
-          if r != nil and r.symChildren.hasKey(k): r.symChildren[k] else: nil,
-          if w != nil and w.symChildren.hasKey(k): w.symChildren[k] else: nil)
+          if r != nil and r.fields.hasKey(k): r.fields[k] else: nil,
+          if w != nil and w.fields.hasKey(k): w.fields[k] else: nil)
 
       for k in allConsts:
         result.add debugNode(key & k,
-          if r != nil and r.constantChildren.hasKey(k): r.constantChildren[k] else: nil,
-          if w != nil and w.constantChildren.hasKey(k): w.constantChildren[k] else: nil)
+          if r != nil and r.constants.hasKey(k): r.constants[k] else: nil,
+          if w != nil and w.constants.hasKey(k): w.constants[k] else: nil)
 
       if r != nil or w != nil:
         result.add debugNode(key & NodeKey(kind: variable),
-          if r != nil: r.variableChildren else: nil,
-          if w != nil: w.variableChildren else: nil)
+          if r != nil: r.variables else: nil,
+          if w != nil: w.variables else: nil)
 
   result = debugNode(@[], t.readRoot, t.writeRoot)
 
