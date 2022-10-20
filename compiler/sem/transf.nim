@@ -465,6 +465,7 @@ proc transformYield(c: PTransf, n: PNode): PNode =
 
 proc transformAddrDeref(c: PTransf, n: PNode, a, b: TNodeKind): PNode =
   result = transformSons(c, n)
+  return
   if c.graph.config.backend == backendCpp or sfCompileToCpp in c.module.flags: return
   var n = result
   case n[0].kind

@@ -311,11 +311,11 @@ proc computeLastReads(cfg: ControlFlowGraph) =
   for pc in 0..<cfg.len:
     template state: State = states[pc]
     if state != nil:
-      # dbg:
-      #   echo "pc:",pc
-      #   echo "lastReads:",toIntSet(state.lastReads)
-      #   echo "potentialLastReads:",toIntSet(state.potentialLastReads)
-      #   echo "notLastReads:",toIntSet(state.notLastReads)
+      dbg:
+        echo "pc:",pc
+        echo "lastReads:",reprHS(state.lastReads)
+        echo "potentialLastReads:",reprHS(state.potentialLastReads)
+        echo "notLastReads:",reprHS(state.notLastReads)
       case cfg[pc].kind
       of def:
         # the path leads to a redefinition of 's' --> sink 's'.

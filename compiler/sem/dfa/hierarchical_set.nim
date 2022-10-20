@@ -1,7 +1,7 @@
 
 type
   NodeKeyKind = enum
-    field, constant, variable
+    field, constant, variable, ptrderef
   NodeKey = object
     case kind: NodeKeyKind
     of field:
@@ -10,15 +10,16 @@ type
       constant: BiggestInt
     of variable:
       variable: PSym
+    of ptrderef:
+      discard
 
 type
   NodeKind = enum
-    Leaf # an atom (int, float etc)
-    RefPtr # an indirection
-    Object # only statically indexable via syms aka fields
-    Array # indexable statically and dynamically within static bounds
-    Infinite # indexable statically and dynamically without any bounds
-    # Seq # represented by Object[len, RefPtr[Object[cap, Infinite]]]
+    Leaf
+    RefPtr
+    Object
+    Array
+    Infinite
   Node = ref object
     # we need a way to differentiate
     # between a node simply serving as a path to a
@@ -29,19 +30,33 @@ type
     instructions: IntSet
     case kind: NodeKind
     of Leaf:
+      # an atom (int, float etc)
       discard
-    of RefPtr, OwnedPtr:
-      # Locations pointed to by a RefPtr are generally not owned, not even
-      # when their parents are owned by us, e.g. sinkparams or ourVars.
+    of RefPtr:
+      # a pointer/ref indirection.
+      # Locations pointed to by a RefPtr are generally not owned,
+      # not even when their parents are owned by us, e.g. sinkparams or ourVars.
       # (Deeper analysis of the control flow/data flow could identify
       #  ourVar RefPtrs that are effectifely owned)
+      # Thus a RefPtrs sublocations do not have to be modeled in detail.
+      # Actually treating it like a leaf however is not sufficient,
+      # since an access to a sublocation must still be recorded, to prevent
+      # the ref from being moved too early. A use of a sublocation can be treated
+      # like a use of the RefPtr itself, and a def of a sublocation can also be treated
+      # like a use of the RefPtr itself (NOT as a def of the RefPtr itself though).
+      #
+      # XXX: Since currently 
+      # 
       # OwnedPtrs (Unique pointers) OTOH are owned by us when we own their parents.
       # The pointer indirection in sequences is one such OwnedPtr.
       target: Node
+    #of OwnedPtr # a pointer/ref indirection to an owned location
     of Object:
-      allFields: HashSet[NodeKey]
+      ## only statically indexable via syms aka fields
+      #allFields: HashSet[PSym]
       fields: Table[PSym, Node]
-    of Array, Infinite:
+    of Array, # indexable statically and dynamically within static bounds
+       Infinite: # indexable statically and dynamically without any bounds
       extent: Slice[BiggestInt]
       constants: Table[BiggestInt, Node]
       variables: Table[PSym, Node]
@@ -57,7 +72,15 @@ proc hash(s: PSym): Hash = hash(cast[pointer](s))
 
 proc typeOfNode(n: PNode): PType =
   const skipped = {tyAlias, tyDistinct, tyGenericInst,
-    tyRef, tyPtr, tyVar, tySink, tyLent, tyOwned}
+    #[tyRef, tyPtr, ]#tyVar, tySink, tyLent, tyOwned}
+  result = n.typ.skipTypes(skipped)
+  # HACK: sometimes typ is tyUntyped, in that case we try to get the sym typ instead
+  if result.kind == tyUntyped and n.kind == nkSym:
+    result = n.sym.typ.skipTypes(skipped)
+
+proc typeOfNode222(n: PNode): PType =
+  const skipped = {tyAlias, tyDistinct, tyGenericInst,
+    #[tyRef, tyPtr,]# tyVar, tySink, tyLent, tyOwned}
   result = n.typ.skipTypes(skipped)
   # HACK: sometimes typ is tyUntyped, in that case we try to get the sym typ instead
   if result.kind == tyUntyped and n.kind == nkSym:
@@ -76,20 +99,23 @@ proc typeToKind(typ: PType): NodeKind =
     tyUInt, tyUInt8, tyUInt16, tyUInt32, tyUInt64,
     tyPointer, tyRange, tySet, tyEnum, tyBool, tyChar, tyProc:
     result = Leaf
+  of tyRef, tyPtr:
+    result = RefPtr
   else:
     #debug typ
     debug typ
     doAssert false, $typ.kind
 
-let
-  seqLen = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
-  seqPtr = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
-  seqCap = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
-  seqData = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
+# let
+#   seqLen = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
+#   seqPtr = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
+#   seqCap = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
+#   seqData = newSym(skField, nil, ItemId() #[nextSymId c.idgen]#, nil, TLineInfo())
 
 proc nodeToNode(n: PNode): Node =
   let typ = typeOfNode(n)
   case typ.kind
+  # # represent seq as Object[len, OwnedPtr[Object[cap, Infinite]]]:
   # of tySequence:
   #   {.cast(noSideEffect).}:
   #     result = Node(kind: Object, fields: {
@@ -103,57 +129,85 @@ proc nodeToNode(n: PNode): Node =
   #       }.toTable)
   else:
     result = Node(kind: typeToKind(typ))
+    # {.cast(noSideEffect).}:
+    #   debugEcho result.kind,'|',n.kind,'/',typ.kind,'\\',n.typ.kind,$n
   #case result.kind == Object: # set bounds/fields
     
 from sequtils import toSeq
+from compiler/ast/typesrenderer import `$`
 
 func collectImportantNodes(n: PNode): seq[PNode] =
+  # {.cast(noSideEffect).}:
+  #   debugEcho n.typ.kind,'|',$n.typ
+  #   debugAst n # tests/destructor/const_smart_ptr.nim line 20 demonstrates that
+  #   # the addr(deref(n)) to n reducing is problematic here.
+  #   debugType n.typ
+  # debugEcho n.typ.skipTypes({tyVar}).kind
   var n = n
   while true:
     case n.kind
-    of PathKinds0 - {nkDotExpr, nkBracketExpr}:
+    of PathKinds0 - {nkDotExpr, nkBracketExpr, nkDerefExpr, nkHiddenDeref}:
       n = n[0]
     of PathKinds1:
       n = n[1]
     of nkDotExpr, nkBracketExpr:
+      assert typeOfNode222(n[0]).kind notin {tyRef, tyPtr}
       result.add n
       n = n[0]
     of nkSym:
       result.add n; break
+    of nkDerefExpr, nkHiddenDeref:
+      if n.kind == nkDerefExpr:
+        assert typeOfNode222(n[0]).kind in {tyRef, tyPtr}, $typeOfNode(n[0]).kind
+        result.add n
+      elif typeOfNode222(n[0]).kind in {tyRef, tyPtr}:
+        result.add n
+      n = n[0]
     else:
       doAssert false, "unreachable" # is it?
 
 var fakeTupleIndexSyms: seq[PSym]
 
-func nodeToPath(n: PNode): seq[NodeKey] =
-  let importantNodes = collectImportantNodes(n)
+func nodesToPath(importantNodes: seq[PNode]): seq[NodeKey] =
   for i in countdown(importantNodes.len-1, 0):
     let n = importantNodes[i]
+
+
     case n.kind
     of nkDotExpr:
       doAssert n[1].kind == nkSym
       result.add NodeKey(kind: field, field: n[1].sym)
     of nkBracketExpr:
-      if typeOfNode(n[0]).kind == tyTuple: # Indexing a tuple
-        {.cast(noSideEffect).}:
-          # hack because sem doesn't transform tup[X] to tup.field_X
-          if fakeTupleIndexSyms.len < n[1].intVal + 1:
-            fakeTupleIndexSyms.setLen n[1].intVal + 1
-          if fakeTupleIndexSyms[n[1].intVal] == nil:
-            fakeTupleIndexSyms[n[1].intVal] =
-              newSym(skField, nil,
-                     ItemId() #[nextSymId c.idgen]#, nil, n[1].info)
-          result.add NodeKey(kind: field, field: fakeTupleIndexSyms[n[1].intVal])
-          continue
-
-      result.add if n[1].kind in nkLiterals:
-                   NodeKey(kind: constant, constant: n[1].intVal)
-                 else:
-                   NodeKey(kind: variable) # Could be a sym or a call
+      let typ = typeOfNode(n[0])
+      if typ.kind == tyTuple: # Indexing a tuple
+        # hack because sem doesn't transform tup[X] to tup.field_X
+        if typ.n != nil:
+          result.add NodeKey(kind: field, field: typ.n.sons[n[1].intVal].sym)
+        else: # Unnamed tuple fields
+          {.cast(noSideEffect).}:
+            if fakeTupleIndexSyms.len < n[1].intVal + 1:
+              fakeTupleIndexSyms.setLen n[1].intVal + 1
+            if fakeTupleIndexSyms[n[1].intVal] == nil:
+              fakeTupleIndexSyms[n[1].intVal] =
+                newSym(skField, nil,
+                       ItemId() #[nextSymId c.idgen]#, nil, n[1].info)
+            result.add NodeKey(kind: field, field: fakeTupleIndexSyms[n[1].intVal])
+      else:
+        result.add if n[1].kind in nkLiterals:
+                     NodeKey(kind: constant, constant: n[1].intVal)
+                   else:
+                     NodeKey(kind: variable) # Could be a sym or a call
     of nkSym:
       # A "field" of the stack/environment
       result.add NodeKey(kind: field, field: n.sym)
+
+    of nkDerefExpr, nkHiddenDeref:
+      result.add NodeKey(kind: ptrderef)
+
     else: doAssert false, "unreachable"
+
+    #if typeOfNode(n).kind in {tyRef, tyPtr}: result.add NodeKey(kind: ptrderef)
+  #debugEcho result
 
 func childrenLen(n: Node): int =
   case n.kind:
@@ -208,23 +262,36 @@ func toIntSet(hs: HierarchicalSet): IntSet =
         toIntSetAux(n, result)
       for n in node.variables.values:
         toIntSetAux(n, result)
-    of Leaf, RefPtr: discard
+    of RefPtr:
+      if node.target != nil:
+        toIntSetAux(node.target, result)
+    of Leaf: discard
 
   toIntSetAux(hs.root, result)
 
 func incl(hs: var HierarchicalSet, loc: PNode, instr: int) =
   var lastRef = hs.root
-  let path = nodeToPath(loc)
   let parts = collectImportantNodes(loc)
+  let path = nodesToPath(parts)
   for i in 0..<path.len:
     let nodeKey = path[i]
     case nodeKey.kind
     of field:
-      lastRef = lastRef.fields.mgetOrPut(nodeKey.field, nodeToNode(parts[^(i+1)]))
+      if nodeKey.field notin lastRef.fields:
+        lastRef.fields[nodeKey.field] = nodeToNode(parts[^(i+1)])
+      lastRef = lastRef.fields[nodeKey.field]
     of constant:
-      lastRef = lastRef.constants.mgetOrPut(nodeKey.constant, nodeToNode(parts[^(i+1)]))
+      if nodeKey.constant notin lastRef.constants:
+        lastRef.constants[nodeKey.constant] = nodeToNode(parts[^(i+1)])
+      lastRef = lastRef.constants[nodeKey.constant]
     of variable:
-      lastRef = lastRef.variables.mgetOrPut(nodeKey.variable, nodeToNode(parts[^(i+1)]))
+      if nodeKey.variable notin lastRef.variables:
+        lastRef.variables[nodeKey.variable] = nodeToNode(parts[^(i+1)])
+      lastRef = lastRef.variables[nodeKey.variable]
+    of ptrderef:
+      if lastRef.target == nil:
+        lastRef.target = nodeToNode(parts[^(i+1)])
+      lastRef = lastRef.target
 
   lastRef.instructions.incl instr
 
@@ -232,7 +299,7 @@ func excl(hs: var HierarchicalSet, loc: PNode, instr: int) =
   # A single instruction int can only correspond to one location PNode
   # so we only need to find one node to exclude the instruction int from
   var lastRef = hs.root
-  let path = nodeToPath(loc)
+  let path = nodesToPath(collectImportantNodes(loc))
   for i in 0..<path.len:
     let nodeKey = path[i]
     case nodeKey.kind
@@ -248,6 +315,10 @@ func excl(hs: var HierarchicalSet, loc: PNode, instr: int) =
       if nodeKey.variable notin lastRef.variables:
         return
       lastRef = lastRef.variables[nodeKey.variable]
+    of ptrderef:
+      if lastRef.target == nil:
+        return
+      lastRef = lastRef.target
 
   lastRef.instructions.excl instr
   # if lastRef.instructions.len == 0:
@@ -281,10 +352,14 @@ func incl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
         else:
           a.variables[k] = copy(child)
 
+    of RefPtr:
+      if b.target != nil:
+        if a.target != nil:
+          incl(a.target, b.target)
+        else:
+          a.target = copy(b.target)
     of Leaf:
       discard # Nothing to do
-    of RefPtr:
-      discard #NYI
 
   if b.root == nil:
     debugEcho "HA"
@@ -328,7 +403,17 @@ func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
       if a.constants.len > 0: result = false
       if a.variables.len > 0: result = false
 
-    of Leaf, RefPtr: discard
+    of RefPtr:
+      var toClean: bool
+      if a.target != nil:
+        if b.target != nil:
+          if excl(a.target, b.target):
+            toClean = true
+      if toClean: a.target = nil
+
+      if a.target != nil: result = false
+
+    of Leaf: discard
 
   discard excl(hs.root, b.root)
 
@@ -337,7 +422,7 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet
   result = HierarchicalSet(root: Node(kind: Object))
   var lastRef = @[hs.root] #TODO Rename, is a sequence because construction needs the kinds,
                            # could be a single lastRef and a list of kinds too
-  let path = nodeToPath(loc)
+  let path = nodesToPath(collectImportantNodes(loc))
   lastRef.setLen path.len
   for i in 0..<path.len-1:
     let nodeKey = path[i]
@@ -350,6 +435,9 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet
       lastRef[i+1] = lastRef[i].constants[nodeKey.constant]
     of variable:
       return # not definitely aliased
+    of ptrderef:
+      if lastRef[i].target == nil: return # Nothing to exclude
+      lastRef[i+1] = lastRef[i].target
 
   template popLocLeaf(children) =
     if locLeaf in lastRef[^1].children:
@@ -367,6 +455,10 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet
           resLastRef = nextResLastRef
         of variable:
           doAssert false, "unreachable"
+        of ptrderef:
+          let nextResLastRef = Node(kind: lastRef[i+1].kind) #XXX Or +1??
+          resLastRef.target = nextResLastRef
+          resLastRef = nextResLastRef
       resLastRef.children[locLeaf] = lastRef[^1].children[locLeaf]
       lastRef[^1].children.del locLeaf
 
@@ -380,6 +472,28 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet
     let locLeaf = locLeaf.constant
     popLocLeaf(constants)
   of variable: discard # not definitely aliased
+  of ptrderef:
+    if lastRef[^1].target != nil:
+      var resLastRef = result.root
+      for i in 0..<path.len-1:
+        let nodeKey = path[i]
+        case nodeKey.kind
+        of field:
+          let nextResLastRef = Node(kind: lastRef[i+1].kind) #XXX Or +1??
+          resLastRef.fields[nodeKey.field] = nextResLastRef
+          resLastRef = nextResLastRef
+        of constant:
+          let nextResLastRef = Node(kind: lastRef[i+1].kind) #XXX Or +1??
+          resLastRef.constants[nodeKey.constant] = nextResLastRef
+          resLastRef = nextResLastRef
+        of variable:
+          doAssert false, "unreachable"
+        of ptrderef:
+          let nextResLastRef = Node(kind: lastRef[i+1].kind) #XXX Or +1??
+          resLastRef.target = nextResLastRef
+          resLastRef = nextResLastRef
+      resLastRef.target = lastRef[^1].target
+      lastRef[^1].target = nil
 
 type BackLastRef = object
   node: Node
@@ -387,7 +501,7 @@ type BackLastRef = object
   parent: int
 
 func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
-  let path = nodeToPath(loc)
+  let path = nodesToPath(collectImportantNodes(loc))
   var lastRefs = @[@[BackLastRef(node: hs.root)]]
   lastRefs.setLen path.len
   for idx in 0..<path.len-1:
@@ -421,6 +535,14 @@ func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
       for i, lastRef in lastRefs[idx]:
         followMaybeAliasedPaths(variables, NodeKey(kind: variable, variable: k))
         followMaybeAliasedPaths(constants, NodeKey(kind: constant, constant: k))
+    of ptrderef:
+      for i, lastRef in lastRefs[idx]:
+        if lastRef.node.target != nil:
+          lastRefs[idx+1].add:
+            BackLastRef(
+              node: lastRef.node.target,
+              key: nodeKey,
+              parent: i)
 
     if lastRefs[idx+1].len == 0:
       result = HierarchicalSet(root: Node(kind: Object))
@@ -456,6 +578,13 @@ func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
     for lastRef in lastRefs[^1]:
       popMaybeAliasedLeaf(constants, NodeKey(kind: constant, constant: k))
       popMaybeAliasedLeaf(variables, NodeKey(kind: variable, variable: k))
+  of ptrderef:
+    for lastRef in lastRefs[^1]:
+      if lastRef.node.target != nil:
+        lastNodes.add BackLastRef(
+          node: lastRef.node.target,
+          key: locLeaf, parent: lastRef.parent)
+        lastRef.node.target = nil
 
   template putput(node, key, child) =
     case key.kind
@@ -465,6 +594,8 @@ func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
       node.constants[key.constant] = child
     of variable:
       node.variables[key.variable] = child
+    of ptrderef:
+      node.target = child
 
 
   # Construct result
@@ -494,7 +625,7 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
   var resLastRefs = @[result.root]
 
   var lastRefs = @[hs.root]
-  let path = nodeToPath(loc)
+  let path = nodesToPath(collectImportantNodes(loc))
   for j in 0..<path.len:
     let nodeKey = path[j]
 
@@ -594,6 +725,49 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
       lastRefs = nextLastRefs
       resLastRefs = nextResLastRefs
 
+    of ptrderef:
+      var i = 0
+      while i < lastRefs.len:
+        if lastRefs[i].target == nil:
+          lastRefs.del i
+          resLastRefs.del i # XXX: Cleanup result???
+        else:
+          let nextLastRef = lastRefs[i].target
+          if nextLastRef.instructions.len > 0:
+            if nextLastRef.childrenLen == 0:
+              lastRefs[i].target = nil # Remove path leading to loc
+              lastRefs.del i
+
+              resLastRefs[i].target = nextLastRef
+              resLastRefs.del i
+            else:
+              lastRefs[i] = nextLastRef
+
+              let resNextLastRef = Node(kind: nextLastRef.kind,
+                                        instructions: nextLastRef.instructions) #XXX
+              resLastRefs[i].target = resNextLastRef
+              resLastRefs[i] = resNextLastRef
+
+              nextLastRef.instructions.clear # Remove node on path leading to loc
+
+              inc i
+          else:
+            if nextLastRef.childrenLen == 0: # Unreachable if hs is cleaned up
+              lastRefs[i].target = nil
+              lastRefs.del i
+
+              resLastRefs.del i
+            else:
+              lastRefs[i] = nextLastRef
+
+              let resNextLastRef = Node(kind: nextLastRef.kind) #XXX
+              resLastRefs[i].target = resNextLastRef
+              resLastRefs[i] = resNextLastRef
+
+              inc i
+
+
+
 
 # Remove loc from the set means to empty it's instruction set
 # It may still serve as a path to other locs
@@ -642,6 +816,8 @@ proc reprNodeKey(k: NodeKey): string =
     $k.constant
   of variable:
     "var:" & $k.variable
+  of ptrderef:
+    "[]"
 
 proc reprNodeKeys(keys: seq[NodeKey]): string =
   for i in 0..<keys.len:
@@ -649,33 +825,37 @@ proc reprNodeKeys(keys: seq[NodeKey]): string =
     result.add "|" & $reprNodeKey(k)
 
 proc reprHS(hs: HierarchicalSet): string =
-  proc debugNode(key: seq[NodeKey], n: Node): string =
-    result.add repeat(' ', key.len)
-    if key.len == 0:
+  proc debugNode(lvl: int, key: NodeKey, n: Node): string =
+    result.add repeat(' ', lvl)
+    if lvl == 0:
       result.add "root"
     else:
-      result.add reprNodeKey key[^1]
-    result.add $n.kind & " " & $n.instructions
+      result.add reprNodeKey key
+    result.add " " & $n.kind & " " & $n.instructions
     result.add "\n"
 
     case n.kind:
     of Object:
       for k, c in n.fields:
-        result.add debugNode(key & NodeKey(kind: field, field: k), c)
+        result.add debugNode(lvl+1, NodeKey(kind: field, field: k), c)
 
     of Array, Infinite:
       for k, c in n.constants:
-        result.add debugNode(key & NodeKey(kind: constant, constant: k), c)
+        result.add debugNode(lvl+1, NodeKey(kind: constant, constant: k), c)
 
       for k, c in n.variables:
-        result.add debugNode(key & NodeKey(kind: variable, variable: k), c)
+        result.add debugNode(lvl+1, NodeKey(kind: variable, variable: k), c)
+
+    of RefPtr:
+      if n.target != nil:
+        result.add debugNode(lvl+1, NodeKey(kind: ptrderef), n.target) #XXX: no key/kind fits here
 
     of Leaf:
       discard
-    of RefPtr:
-      result.add debugNode(key & NodeKey(), n.target)
+    #of OwnedPtr:
+    #  result.add debugNode(lvl+1, NodeKey(), n.target)
 
-  result = debugNode(@[], hs.root)
+  result = debugNode(0, NodeKey(kind: field), hs.root)
 
 proc debugA(hs: HierarchicalSet): HierarchicalSet =
   echo reprHS hs
