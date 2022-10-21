@@ -20,9 +20,11 @@ type
       # | \ | / |
       # \__d(x)_/
       # This occurs when joining paths in which one wrote x but the other one didn't
+      # This is the same as implicitlyRead and can exist as a leaf too.
   TaintNode = ref object
-    taint: bool # read: false: implicitly read, true: explicitly read
-                # write: false: not written before read, true: written before read
+    taint: bool
+      # read: false: implicitly read, true: explicitly read
+      # write: false: not written before read, true: written before read
     fields: Table[NodeKey, TaintNode]
     constants: Table[NodeKey, TaintNode]
     variables: TaintNode
@@ -35,9 +37,9 @@ type
 
   TaintTree = object
     # Example taint tree:
-    #          root
-    #      s            t
-    #r(s.x) w(s.y)    r(t[i])
+    #            root
+    #       s            t
+    # r(s.x) w(s.y)   r(t[i])
     # Child nodes always taint their parents
     # as read implicitly (without their taintkind actually reflecting it)
     # A taint tree also only needs to support insertion, no removal.

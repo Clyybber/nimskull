@@ -60,7 +60,7 @@ type
       fields: Table[PSym, Node]
     of Array, # indexable statically and dynamically within static bounds
        Infinite: # indexable statically and dynamically without any bounds
-      extent: Slice[BiggestInt]
+      #extent: Slice[BiggestInt]
       constants: Table[BiggestInt, Node]
       variables: Table[PSym, Node]
 
@@ -213,19 +213,18 @@ func incl(hs: var HierarchicalSet, loc: PNode, instr: int) =
   let path = nodesToPath(parts)
   for i in 0..<path.len:
     let nodeKey = path[i]
+    template traverseOrCreate(children, key) =
+      if key notin children:
+        children[key] = nodeToNode(parts[^(i+1)])
+      lastRef = children[key]
+
     case nodeKey.kind
     of field:
-      if nodeKey.field notin lastRef.fields:
-        lastRef.fields[nodeKey.field] = nodeToNode(parts[^(i+1)])
-      lastRef = lastRef.fields[nodeKey.field]
+      traverseOrCreate(lastRef.fields, nodeKey.field)
     of constant:
-      if nodeKey.constant notin lastRef.constants:
-        lastRef.constants[nodeKey.constant] = nodeToNode(parts[^(i+1)])
-      lastRef = lastRef.constants[nodeKey.constant]
+      traverseOrCreate(lastRef.constants, nodeKey.constant)
     of variable:
-      if nodeKey.variable notin lastRef.variables:
-        lastRef.variables[nodeKey.variable] = nodeToNode(parts[^(i+1)])
-      lastRef = lastRef.variables[nodeKey.variable]
+      traverseOrCreate(lastRef.variables, nodeKey.variable)
 
   lastRef.instructions.incl instr
 
@@ -236,19 +235,18 @@ func excl(hs: var HierarchicalSet, loc: PNode, instr: int) =
   let path = nodesToPath(collectImportantNodes(loc))
   for i in 0..<path.len:
     let nodeKey = path[i]
+    template traverseOrExit(children, key) =
+      if key notin children:
+        return
+      lastRef = children[key]
+
     case nodeKey.kind
     of field:
-      if nodeKey.field notin lastRef.fields:
-        return
-      lastRef = lastRef.fields[nodeKey.field]
+      traverseOrExit(lastRef.fields, nodeKey.field)
     of constant:
-      if nodeKey.constant notin lastRef.constants:
-        return
-      lastRef = lastRef.constants[nodeKey.constant]
+      traverseOrExit(lastRef.constants, nodeKey.constant)
     of variable:
-      if nodeKey.variable notin lastRef.variables:
-        return
-      lastRef = lastRef.variables[nodeKey.variable]
+      traverseOrExit(lastRef.variables, nodeKey.variable)
 
   lastRef.instructions.excl instr
   # if lastRef.instructions.len == 0:
@@ -259,29 +257,19 @@ func excl(hs: var HierarchicalSet, loc: PNode, instr: int) =
 func incl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
   func incl(a: Node, b: Node) =
     a.instructions.incl b.instructions
+    template inclOrCreate(achilds, bchilds) =
+      for k, child in bchilds:
+        if k in achilds:
+          incl(achilds[k], child)
+        else:
+          achilds[k] = copy(child)
 
     case b.kind:
     of Object:
-      for k, child in b.fields:
-        # mGetOrPut would work too
-        if k in a.fields:
-          incl(a.fields[k], child)
-        else:
-          a.fields[k] = copy(child)
-
+      inclOrCreate(a.fields, b.fields)
     of Array, Infinite:
-      for k, child in b.constants:
-        if k in a.constants:
-          incl(a.constants[k], child)
-        else:
-          a.constants[k] = copy(child)
-
-      for k, child in b.variables:
-        if k in a.variables:
-          incl(a.variables[k], child)
-        else:
-          a.variables[k] = copy(child)
-
+      inclOrCreate(a.constants, b.constants)
+      inclOrCreate(a.variables, b.variables)
     of Leaf:
       discard # Nothing to do
 
@@ -295,38 +283,24 @@ func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
     result = true
     a.instructions.excl b.instructions
     if a.instructions.len > 0: result = false
+    template exclAndClean(achilds, bchilds) =
+      block:
+        var toClean: seq[type(achilds.keys)]
+        for k, child in achilds:
+          if k in bchilds:
+            if excl(child, bchilds[k]):
+              toClean.add k
+        for k in toClean: achilds.del k
 
     case a.kind:
     of Object:
-      var toClean: seq[PSym]
-      for k, child in a.fields:
-        if k in b.fields:
-          if excl(child, b.fields[k]):
-            toClean.add k
-      for k in toClean: a.fields.del k
-
+      exclAndClean(a.fields, b.fields)
       if a.fields.len > 0: result = false
-
     of Array, Infinite:
-      block:
-        var toClean: seq[BiggestInt]
-        for k, child in a.constants:
-          if k in b.constants:
-            if excl(child, b.constants[k]):
-              toClean.add k
-        for k in toClean: a.constants.del k
-
-      block:
-        var toClean: seq[PSym]
-        for k, child in a.variables:
-          if k in b.variables:
-            if excl(child, b.variables[k]):
-              toClean.add k
-        for k in toClean: a.variables.del k
-
+      exclAndClean(a.constants, b.constants)
+      exclAndClean(a.variables, b.variables)
       if a.constants.len > 0: result = false
       if a.variables.len > 0: result = false
-
     of Leaf: discard
 
   discard excl(hs.root, b.root)
@@ -672,8 +646,6 @@ proc reprHS(hs: HierarchicalSet): string =
 
     of Leaf:
       discard
-    #of OwnedPtr:
-    #  result.add debugNode(lvl+1, NodeKey(), n.target)
 
   result = debugNode(0, NodeKey(kind: field), hs.root)
 
