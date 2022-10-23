@@ -678,7 +678,7 @@ proc reportBody*(conf: ConfigRef, r: SemReport): string =
 
     of rsemUndeclaredField:
       result =  "undeclared field: '$1' for type $2" % [
-        $r.ast.ident.s, $getProcHeader(conf, r.sym)]
+        $r.ast.render, $getProcHeader(conf, r.sym)]
 
     of rsemCannotCodegenCompiletimeProc:
       result = "request to generate code for .compileTime proc: " & r.symstr
