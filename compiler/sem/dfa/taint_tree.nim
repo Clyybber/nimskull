@@ -25,9 +25,9 @@ type
     taint: bool
       # read: false: implicitly read, true: explicitly read
       # write: false: not written before read, true: written before read
-    fields: Table[NodeKey, TaintNode]
-    constants: Table[NodeKey, TaintNode]
-    variables: TaintNode
+    fields: Table[PSym, TaintNode]
+    constants: Table[BiggestInt, TaintNode]
+    variables: Table[PSym, TaintNode]
       # Only one node for now, change back to Table[NodeKey, TaintNode]
       # if smarter variable analysis is implemented
       # Smarter variable analysis could simply assign
@@ -58,16 +58,16 @@ func taintRead(hs: var TaintTree, loc: PNode) =
     let nodeKey = path[i]
     case nodeKey.kind
     of field:
-      if nodeKey in writeLastRef.fields:
-        writeLastRef = writeLastRef.fields[nodeKey]
+      if nodeKey.field in writeLastRef.fields:
+        writeLastRef = writeLastRef.fields[nodeKey.field]
       else: break
     of constant:
-      if nodeKey in writeLastRef.constants:
-        writeLastRef = writeLastRef.constants[nodeKey]
+      if nodeKey.constant in writeLastRef.constants:
+        writeLastRef = writeLastRef.constants[nodeKey.constant]
       else: break
     of variable:
-      if writeLastRef.variables != nil:
-        writeLastRef = writeLastRef.variables
+      if nodeKey.variable in writeLastRef.variables:
+        writeLastRef = writeLastRef.variables[nodeKey.variable]
       else: break
 
   var readLastRef = hs.readRoot
@@ -78,17 +78,17 @@ func taintRead(hs: var TaintTree, loc: PNode) =
     let nodeKey = path[i]
     case nodeKey.kind
     of field:
-      if nodeKey notin readLastRef.fields:
-        readLastRef.fields[nodeKey] = TaintNode()
-      readLastRef = readLastRef.fields[nodeKey]
+      if nodeKey.field notin readLastRef.fields:
+        readLastRef.fields[nodeKey.field] = TaintNode()
+      readLastRef = readLastRef.fields[nodeKey.field]
     of constant:
-      if nodeKey notin readLastRef.constants:
-        readLastRef.constants[nodeKey] = TaintNode()
-      readLastRef = readLastRef.constants[nodeKey]
+      if nodeKey.constant notin readLastRef.constants:
+        readLastRef.constants[nodeKey.constant] = TaintNode()
+      readLastRef = readLastRef.constants[nodeKey.constant]
     of variable:
-      if readLastRef.variables == nil:
-        readLastRef.variables = TaintNode()
-      readLastRef = readLastRef.variables
+      if nodeKey.variable notin readLastRef.variables:
+        readLastRef.variables[nodeKey.variable] = TaintNode()
+      readLastRef = readLastRef.variables[nodeKey.variable]
 
   readLastRef.taint = true
   # The following turns (read: true, write: true) into (read: true, write: false)
@@ -110,16 +110,16 @@ func taintWrite(hs: var TaintTree, loc: PNode) =
     let nodeKey = path[i]
     case nodeKey.kind
     of field:
-      if nodeKey in readLastRef.fields:
-        readLastRef = readLastRef.fields[nodeKey]
+      if nodeKey.field in readLastRef.fields:
+        readLastRef = readLastRef.fields[nodeKey.field]
       else: readLastRef = nil; break
     of constant:
-      if nodeKey in readLastRef.constants:
-        readLastRef = readLastRef.constants[nodeKey]
+      if nodeKey.constant in readLastRef.constants:
+        readLastRef = readLastRef.constants[nodeKey.constant]
       else: readLastRef = nil; break
     of variable:
-      if readLastRef.variables != nil:
-        readLastRef = readLastRef.variables
+      if nodeKey.variable in readLastRef.variables:
+        readLastRef = readLastRef.variables[nodeKey.variable]
       else: readLastRef = nil; break
 
   var writeLastRef = hs.writeRoot
@@ -130,23 +130,23 @@ func taintWrite(hs: var TaintTree, loc: PNode) =
     let nodeKey = path[i]
     case nodeKey.kind
     of field:
-      if nodeKey notin writeLastRef.fields:
-        writeLastRef.fields[nodeKey] = TaintNode()
-      writeLastRef = writeLastRef.fields[nodeKey]
+      if nodeKey.field notin writeLastRef.fields:
+        writeLastRef.fields[nodeKey.field] = TaintNode()
+      writeLastRef = writeLastRef.fields[nodeKey.field]
     of constant:
-      if nodeKey notin writeLastRef.constants:
-        writeLastRef.constants[nodeKey] = TaintNode()
-      writeLastRef = writeLastRef.constants[nodeKey]
+      if nodeKey.constant notin writeLastRef.constants:
+        writeLastRef.constants[nodeKey.constant] = TaintNode()
+      writeLastRef = writeLastRef.constants[nodeKey.constant]
     of variable:
-      if writeLastRef.variables == nil:
-        writeLastRef.variables = TaintNode()
-      writeLastRef = writeLastRef.variables
+      if nodeKey.variable notin writeLastRef.variables:
+        writeLastRef.variables[nodeKey.variable] = TaintNode()
+      writeLastRef = writeLastRef.variables[nodeKey.variable]
 
   if not(readLastRef != nil and readLastRef.taint): # read before write: nothing
     writeLastRef.taint = true
 
 func len(n: TaintNode): int =
-  n.fields.len + n.constants.len + ord(n.variables != nil)
+  n.fields.len + n.constants.len + n.variables.len
 
 proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
   # merge
@@ -164,93 +164,64 @@ proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
     if readCursorA != nil or writeCursorA != nil or
        readCursorB != nil or writeCursorB != nil:
 
-      var allSyms, allConsts: HashSet[NodeKey]
-      if readCursorA != nil:
-        allSyms.incl readCursorA.fields.keys.toSeq.toHashSet
-        allConsts.incl readCursorA.constants.keys.toSeq.toHashSet
-      if writeCursorA != nil:
-        allSyms.incl writeCursorA.fields.keys.toSeq.toHashSet
-        allConsts.incl writeCursorA.constants.keys.toSeq.toHashSet
-      if readCursorB != nil:
-        allSyms.incl readCursorB.fields.keys.toSeq.toHashSet
-        allConsts.incl readCursorB.constants.keys.toSeq.toHashSet
-      if writeCursorB != nil:
-        allSyms.incl writeCursorB.fields.keys.toSeq.toHashSet
-        allConsts.incl writeCursorB.constants.keys.toSeq.toHashSet
+      var
+        allFields: HashSet[PSym]
+        allConsts: HashSet[BiggestInt]
+        allVars: HashSet[PSym]
 
-      if readCursorB != nil: result.read = readCursorB
-      if readCursorA != nil: result.read = readCursorA
-      if writeCursorB != nil: result.write = writeCursorB
-      if writeCursorA != nil: result.write = writeCursorA
+      template collectChilds(n, res) =
+        if n != nil:
+          allFields.incl n.fields.keys.toSeq.toHashSet
+          allConsts.incl n.constants.keys.toSeq.toHashSet
+          allVars.incl n.variables.keys.toSeq.toHashSet
+          res = n
 
-      for k in allSyms:
-        let (read, write) = mergeTaintTreesAux(
-          if readCursorA != nil and readCursorA.fields.hasKey(k):
-            readCursorA.fields[k]
-          else: nil,
-          if writeCursorA != nil and writeCursorA.fields.hasKey(k):
-            writeCursorA.fields[k]
-          else: nil,
-          if readCursorB != nil and readCursorB.fields.hasKey(k):
-            readCursorB.fields[k]
-          else: nil,
-          if writeCursorB != nil and writeCursorB.fields.hasKey(k):
-            writeCursorB.fields[k]
-          else: nil)
-        if read != nil:
-          result.read.fields[k] = read
-        if write != nil:
-          result.write.fields[k] = write
+      collectChilds(readCursorB, result.read)
+      collectChilds(writeCursorB, result.write)
+      collectChilds(readCursorA, result.read)
+      collectChilds(writeCursorA, result.write)
 
-      for k in allConsts:
-        let (read, write) = mergeTaintTreesAux(
-          if readCursorA != nil and readCursorA.constants.hasKey(k):
-            readCursorA.constants[k]
-          else: nil,
-          if writeCursorA != nil and writeCursorA.constants.hasKey(k):
-            writeCursorA.constants[k]
-          else: nil,
-          if readCursorB != nil and readCursorB.constants.hasKey(k):
-            readCursorB.constants[k]
-          else: nil,
-          if writeCursorB != nil and writeCursorB.constants.hasKey(k):
-            writeCursorB.constants[k]
-          else: nil)
-        if read != nil:
-          result.read.constants[k] = read
-        if write != nil:
-          result.write.constants[k] = write
+      template recurse(allChilds, childs) =
+        for k in allChilds:
+          let (read, write) = mergeTaintTreesAux(
+            if readCursorA != nil and k in readCursorA.childs:
+              readCursorA.childs[k]
+            else: nil,
+            if writeCursorA != nil and k in writeCursorA.childs:
+              writeCursorA.childs[k]
+            else: nil,
+            if readCursorB != nil and k in readCursorB.childs:
+              readCursorB.childs[k]
+            else: nil,
+            if writeCursorB != nil and k in writeCursorB.childs:
+              writeCursorB.childs[k]
+            else: nil)
+          if read != nil:
+            result.read.childs[k] = read
+          if write != nil:
+            result.write.childs[k] = write
 
-      block:
-        let (read, write) = mergeTaintTreesAux(
-          if readCursorA != nil: readCursorA.variables else: nil,
-          if writeCursorA != nil: writeCursorA.variables else: nil,
-          if readCursorB != nil: readCursorB.variables else: nil,
-          if writeCursorB != nil: writeCursorB.variables else: nil)
-        if read != nil:
-          result.read.variables = read
-        if write != nil:
-          result.write.variables = write
+      recurse(allFields, fields)
+      recurse(allConsts, constants)
+      recurse(allVars, variables)
 
       # reads merge quite simply:
-      #if   readCursorA != nil and readCursorB == nil: #handled before the for loops
-      #  result.read = readCursorB
-      #elif readCursorA == nil and readCursorB != nil: #handled before the for loops
-      #  result.read = readCursorA
-      #elif readCursorA == nil and readCursorB == nil: #implicitly nil
-      #  result.read = nil
       if readCursorA != nil and readCursorB != nil:
         #result.read = readCursorA #handled before the for loops
         result.read.taint = readCursorA.taint or readCursorB.taint
+      #elif readCursorA != nil: #handled before the for loops
+      #  result.read = readCursorA
+      #elif readCursorB != nil: #handled before the for loops
+      #  result.read = readCursorB
+      #else: #implicitly nil
+      #  result.read = nil
 
       # writes are a bit more complex:
       if writeCursorA != nil and writeCursorB != nil:
-        #result.read = readCursorA #handled before the for loops
+        #result.write = writeCursorA #handled before the for loops
         result.write.taint = writeCursorA.taint and writeCursorB.taint
-      elif writeCursorA != nil and writeCursorB == nil:
-        result.write.taint = false # deactivated write, since it doesn't occur in B
-      elif writeCursorA == nil and writeCursorB != nil:
-        result.write.taint = false # deactivated write, since it doesn't occur in A
+      elif writeCursorA != nil or writeCursorB != nil:
+        result.write.taint = false # deactivated write, since it only occurs in A xor B
 
   var newA = mergeTaintTreesAux(a.readRoot, a.writeRoot, b.readRoot, b.writeRoot)
   a = TaintTree(readRoot: newA.read, writeRoot: newA.write)
@@ -266,57 +237,52 @@ func copy(n: TaintNode): TaintNode =
     child = copy(child)
   for child in result.constants.mvalues:
     child = copy(child)
-  if result.variables != nil:
-    result.variables = copy(result.variables)
+  for child in result.variables.mvalues:
+    child = copy(child)
 
 func copy(t: TaintTree): TaintTree = TaintTree(readRoot: copy(t.readRoot), writeRoot: copy(t.writeRoot))
 
 proc `$`(t: TaintTree): string =
-  proc reprNodeKeys(keys: seq[NodeKey]): string =
-    let k = keys[^1]
-    case k.kind
-    of field:
-      $k.field
-    of constant:
-      $k.constant
-    of variable:
-      "var"
-
-  proc debugNode(key: seq[NodeKey], r, w: TaintNode): string =
+  proc debugNode(lvl: int, key: NodeKey, r, w: TaintNode): string =
     if r != nil or w != nil:
-      result.add repeat(' ', key.len)
-      if key.len == 0:
+      result.add repeat(' ', lvl)
+      if lvl == 0:
         result.add "root"
       else:
-        result.add reprNodeKeys key
+        result.add reprNodeKey key
       if r != nil:
         result.add " r(" & $r.taint & ")"
       if w != nil:
         result.add " w(" & $w.taint & ")"
       result.add "\n"
 
-      var allSyms, allConsts: HashSet[NodeKey]
+      var
+        allFields: HashSet[PSym]
+        allConsts: HashSet[BiggestInt]
+        allVars: HashSet[PSym]
       if r != nil:
-        allSyms.incl r.fields.keys.toSeq.toHashSet
+        allFields.incl r.fields.keys.toSeq.toHashSet
         allConsts.incl r.constants.keys.toSeq.toHashSet
+        allVars.incl r.variables.keys.toSeq.toHashSet
       if w != nil:
-        allSyms.incl w.fields.keys.toSeq.toHashSet
+        allFields.incl w.fields.keys.toSeq.toHashSet
         allConsts.incl w.constants.keys.toSeq.toHashSet
+        allVars.incl w.variables.keys.toSeq.toHashSet
 
-      for k in allSyms:
-        result.add debugNode(key & k,
-          if r != nil and r.fields.hasKey(k): r.fields[k] else: nil,
-          if w != nil and w.fields.hasKey(k): w.fields[k] else: nil)
+      for k in allFields:
+        result.add debugNode(lvl+1, NodeKey(kind: field, field: k),
+          if r != nil and k in r.fields: r.fields[k] else: nil,
+          if w != nil and k in w.fields: w.fields[k] else: nil)
 
       for k in allConsts:
-        result.add debugNode(key & k,
-          if r != nil and r.constants.hasKey(k): r.constants[k] else: nil,
-          if w != nil and w.constants.hasKey(k): w.constants[k] else: nil)
+        result.add debugNode(lvl+1, NodeKey(kind: constant, constant: k),
+          if r != nil and k in r.constants: r.constants[k] else: nil,
+          if w != nil and k in w.constants: w.constants[k] else: nil)
 
-      if r != nil or w != nil:
-        result.add debugNode(key & NodeKey(kind: variable),
-          if r != nil: r.variables else: nil,
-          if w != nil: w.variables else: nil)
+      for k in allVars:
+        result.add debugNode(lvl+1, NodeKey(kind: variable, variable: k),
+          if r != nil and k in r.variables: r.variables[k] else: nil,
+          if w != nil and k in w.variables: w.variables[k] else: nil)
 
-  result = debugNode(@[], t.readRoot, t.writeRoot)
+  result = debugNode(0, NodeKey(kind: field), t.readRoot, t.writeRoot)
 

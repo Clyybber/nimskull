@@ -42,14 +42,14 @@ type
     Object
     Array
     Infinite
-  Node = ref object
+  Node[T] = ref object
     # we need a way to differentiate
     # between a node simply serving as a path to a
     # subnode, or being a node itself. For now we
     # just check if instructions is empty.
     # This is a set because the same location
     # could be read in different instructions
-    instructions: IntSet
+    data: T
     case kind: NodeKind
     of Leaf:
       # an atom (int, float etc)
@@ -57,15 +57,19 @@ type
     of Object:
       ## only statically indexable via syms aka fields
       #allFields: HashSet[PSym]
-      fields: Table[PSym, Node]
+      fields: Table[PSym, Node[T]]
     of Array, # indexable statically and dynamically within static bounds
        Infinite: # indexable statically and dynamically without any bounds
       #extent: Slice[BiggestInt]
-      constants: Table[BiggestInt, Node]
-      variables: Table[PSym, Node]
+      constants: Table[BiggestInt, Node[T]]
+      variables: Table[PSym, Node[T]]
+
+  SetNode = Node[IntSet]
 
   HierarchicalSet = object
-    root: Node
+    root: SetNode
+
+template instructions(n: SetNode): IntSet = n.data
 
 import compiler/utils/astrepr
 
@@ -96,9 +100,9 @@ proc typeToKind(typ: PType): NodeKind =
     debug typ
     doAssert false, $typ.kind
 
-proc nodeToNode(n: PNode): Node =
+proc nodeToNode(n: PNode): SetNode =
   let typ = typeOfNode(n)
-  result = Node(kind: typeToKind(typ))
+  result = SetNode(kind: typeToKind(typ))
     
 from sequtils import toSeq
 from compiler/ast/typesrenderer import `$`
@@ -148,7 +152,9 @@ func nodesToPath(importantNodes: seq[PNode]): seq[NodeKey] =
         result.add if n[1].kind in nkLiterals:
                      NodeKey(kind: constant, constant: n[1].intVal)
                    else:
-                     NodeKey(kind: variable) # Could be a sym or a call
+                     NodeKey(kind: variable, variable: nil)
+                       # Could be a sym or a call
+                       # but currently all variables treated as one (nil)
     of nkSym:
       # A "field" of the stack/environment
       result.add NodeKey(kind: field, field: n.sym)
@@ -157,7 +163,7 @@ func nodesToPath(importantNodes: seq[PNode]): seq[NodeKey] =
 
   #debugEcho result
 
-func childrenLen(n: Node): int =
+func childrenLen(n: SetNode): int =
   case n.kind:
   of Leaf: 0
   of Object:
@@ -165,24 +171,24 @@ func childrenLen(n: Node): int =
   of Array, Infinite:
     n.constants.len + n.variables.len
 
-func copy(n: Node): Node =
+func copy(n: SetNode): SetNode =
   case n.kind:
   of Leaf:
-    result = Node(instructions: n.instructions, kind: Leaf)
+    result = SetNode(data: n.instructions, kind: Leaf)
   of Object:
-    result = Node(instructions: n.instructions, kind: Object,
+    result = SetNode(data: n.instructions, kind: Object,
                   fields: n.fields)
     for child in result.fields.mvalues:
       child = copy(child)
   of Array:
-    result = Node(instructions: n.instructions, kind: Array,
+    result = SetNode(data: n.instructions, kind: Array,
                   constants: n.constants, variables: n.variables)
     for child in result.constants.mvalues:
       child = copy(child)
     for child in result.variables.mvalues:
       child = copy(child)
   of Infinite:
-    result = Node(instructions: n.instructions, kind: Infinite,
+    result = SetNode(data: n.instructions, kind: Infinite,
                   constants: n.constants, variables: n.variables)
     for child in result.constants.mvalues:
       child = copy(child)
@@ -192,7 +198,7 @@ func copy(n: Node): Node =
 func copy(hs: HierarchicalSet): HierarchicalSet = HierarchicalSet(root: copy(hs.root))
 
 func toIntSet(hs: HierarchicalSet): IntSet =
-  func toIntSetAux(node: Node, result: var IntSet) =
+  func toIntSetAux(node: SetNode, result: var IntSet) =
     result.incl node.instructions
     case node.kind
     of Object:
@@ -255,7 +261,7 @@ func excl(hs: var HierarchicalSet, loc: PNode, instr: int) =
 
 
 func incl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
-  func incl(a: Node, b: Node) =
+  func incl(a, b: SetNode) =
     a.instructions.incl b.instructions
     template inclOrCreate(achilds, bchilds) =
       for k, child in bchilds:
@@ -279,7 +285,7 @@ func incl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
 
 
 func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
-  func excl(a: Node, b: Node): bool =
+  func excl(a, b: SetNode): bool =
     result = true
     a.instructions.excl b.instructions
     if a.instructions.len > 0: result = false
@@ -307,7 +313,7 @@ func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
 
 
 func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
-  result = HierarchicalSet(root: Node(kind: Object))
+  result = HierarchicalSet(root: SetNode(kind: Object))
   var lastRef = @[hs.root] #TODO Rename, is a sequence because construction needs the kinds,
                            # could be a single lastRef and a list of kinds too
   let path = nodesToPath(collectImportantNodes(loc))
@@ -331,11 +337,11 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet
         let nodeKey = path[i]
         case nodeKey.kind
         of field:
-          let nextResLastRef = Node(kind: lastRef[i+1].kind) #XXX Or +1??
+          let nextResLastRef = SetNode(kind: lastRef[i+1].kind) #XXX Or +1??
           resLastRef.fields[nodeKey.field] = nextResLastRef
           resLastRef = nextResLastRef
         of constant:
-          let nextResLastRef = Node(kind: lastRef[i+1].kind) #XXX Or +1??
+          let nextResLastRef = SetNode(kind: lastRef[i+1].kind) #XXX Or +1??
           resLastRef.constants[nodeKey.constant] = nextResLastRef
           resLastRef = nextResLastRef
         of variable:
@@ -355,7 +361,7 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet
   of variable: discard # not definitely aliased
 
 type BackLastRef = object
-  node: Node
+  node: SetNode
   key: NodeKey
   parent: int
 
@@ -396,7 +402,7 @@ func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
         followMaybeAliasedPaths(constants, NodeKey(kind: constant, constant: k))
 
     if lastRefs[idx+1].len == 0:
-      result = HierarchicalSet(root: Node(kind: Object))
+      result = HierarchicalSet(root: SetNode(kind: Object))
       return # Nothing to exclude
 
   # Remove loc, loc.X, loc[i], loc[1]
@@ -451,7 +457,7 @@ func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
       for k in parents:
         let lr = lastRefs[idx][k]
         if lr.parent notin newParents:
-          lastRefs[idx-1][lr.parent].node = Node(kind: lastRefs[idx-1][lr.parent].node.kind) #XXX
+          lastRefs[idx-1][lr.parent].node = SetNode(kind: lastRefs[idx-1][lr.parent].node.kind) #XXX
         newParents.incl lr.parent
         lastRefs[idx-1][lr.parent].node.putput(lr.key, lr.node)
       parents = newParents
@@ -460,10 +466,10 @@ func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
     result = HierarchicalSet(root: lastRefs[0][0].node)
 
   else:
-    result = HierarchicalSet(root: Node(kind: Object))
+    result = HierarchicalSet(root: SetNode(kind: Object))
 
 func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
-  result = HierarchicalSet(root: Node(kind: Object))
+  result = HierarchicalSet(root: SetNode(kind: Object))
   var resLastRefs = @[result.root]
 
   var lastRefs = @[hs.root]
@@ -489,8 +495,8 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
             else:
               lastRefs[i] = nextLastRef
 
-              let resNextLastRef = Node(kind: nextLastRef.kind,
-                                        instructions: nextLastRef.instructions) #XXX
+              let resNextLastRef = SetNode(kind: nextLastRef.kind,
+                                           data: nextLastRef.instructions) #XXX
               resLastRefs[i].children[nodeKeyContent] = resNextLastRef
               resLastRefs[i] = resNextLastRef
 
@@ -506,7 +512,7 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
             else:
               lastRefs[i] = nextLastRef
 
-              let resNextLastRef = Node(kind: nextLastRef.kind) #XXX
+              let resNextLastRef = SetNode(kind: nextLastRef.kind) #XXX
               resLastRefs[i].children[nodeKeyContent] = resNextLastRef
               resLastRefs[i] = resNextLastRef
 
@@ -525,8 +531,8 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
           else:
             nextLastRefs.add nextLastRef # Recurse into children of ...[var/const]
 
-            let resNextLastRef = Node(kind: nextLastRef.kind,
-                                      instructions: nextLastRef.instructions) #XXX
+            let resNextLastRef = SetNode(kind: nextLastRef.kind,
+                                         data: nextLastRef.instructions) #XXX
             resLastRefs[i].children[key] = resNextLastRef
             nextResLastRefs.add resNextLastRef
 
@@ -537,7 +543,7 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
           else:
             nextLastRefs.add nextLastRef # Recurse into children of ...[var/const]
 
-            let resNextLastRef = Node(kind: nextLastRef.kind) #XXX
+            let resNextLastRef = SetNode(kind: nextLastRef.kind) #XXX
             resLastRefs[i].children[key] = resNextLastRef
             nextResLastRefs.add resNextLastRef
 
@@ -545,8 +551,8 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
     of field:
       followDefinitelyAliasedPaths(fields, nodeKey.field)
     of constant:
-      var nextLastRefs: seq[Node]
-      var nextResLastRefs: seq[Node]
+      var nextLastRefs: seq[SetNode]
+      var nextResLastRefs: seq[SetNode]
 
       for i in 0..<lastRefs.len:
         followMaybeAliasedPaths(variables)
@@ -557,8 +563,8 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
       resLastRefs.add nextResLastRefs
 
     of variable:
-      var nextLastRefs: seq[Node]
-      var nextResLastRefs: seq[Node]
+      var nextLastRefs: seq[SetNode]
+      var nextResLastRefs: seq[SetNode]
 
       for i in 0..<lastRefs.len:
         followMaybeAliasedPaths(constants)
@@ -617,13 +623,8 @@ proc reprNodeKey(k: NodeKey): string =
   of variable:
     "var:" & $k.variable
 
-proc reprNodeKeys(keys: seq[NodeKey]): string =
-  for i in 0..<keys.len:
-    let k = keys[i]
-    result.add "|" & $reprNodeKey(k)
-
 proc reprHS(hs: HierarchicalSet): string =
-  proc debugNode(lvl: int, key: NodeKey, n: Node): string =
+  proc debugNode(lvl: int, key: NodeKey, n: SetNode): string =
     result.add repeat(' ', lvl)
     if lvl == 0:
       result.add "root"
