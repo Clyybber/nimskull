@@ -49,6 +49,8 @@ type
       dest*: int
     of use, def:
       n*: PNode # contains the def/use location.
+      # OFFSETHACK:
+      # offset*: int
 
 
   ControlFlowGraph* = seq[Instr]
@@ -384,8 +386,18 @@ when true:
       # 'while true' is an idiom in Nim and so we produce
       # better code for it:
       withBlock(nil):
-        for i in 0..1:
-          c.gen(n[1])
+        let firstCache = c.cachewI()
+        c.gen(n[1])
+        c.patch(firstCache)
+        c.code.add Instr(kind: cacher, dest: int firstCache)
+
+        let start = c.code.len
+        c.gen(n[1])
+        for i in start..<c.code.len:
+          c.code[i] = Instr(kind: goto, dest: 1)
+          # OFFSETHACK:
+          # if c.code[i].kind == use:
+          #   c.code[i].offset -= c.code.len - start
     else:
       withBlock(nil):
         var endings: array[2, TPosition]
@@ -397,7 +409,12 @@ when true:
         c.gen(n[0])
         endings[1] = c.forkI()
         c.code.add Instr(kind: cacher, dest: int firstCache)
+
+        let start = c.code.len
         c.gen(n[1]) # Remove this
+        for i in start..<c.code.len:
+          c.code[i] = Instr(kind: goto, dest: 1)
+
         c.patch(endings[1])
         c.patch(endings[0])
 

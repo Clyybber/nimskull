@@ -1,39 +1,30 @@
 type
-  TaintKind = enum
-    implicitlyRead #(readTaint: false, writeTaint: false)
-    read # not last read #(readTaint: true, writeTaint: false)
-      # maybeAliasing
-      # | \ | / |
-      # \__r(x)_/
-      # / / | \ \
-      # maybeAliased
-    write # could be last read #(readTaint: false, writeTaint: true)
-      # maybeAliasing
-      # | \ | / |
-      # \__r(x)_/
-      #   / | \
-      # defAliased
-    writeAndRead #(readTaint: true, writeTaint: true)
-      # this was first written and then read from
-    deactivatedWrite #(readTaint: false, writeTaint: false)
-      # maybeAliasing
-      # | \ | / |
-      # \__d(x)_/
-      # This occurs when joining paths in which one wrote x but the other one didn't
-      # This is the same as implicitlyRead and can exist as a leaf too.
-  TaintNode = ref object
-    taint: bool
-      # read: false: implicitly read, true: explicitly read
-      # write: false: not written before read, true: written before read
-    fields: Table[PSym, TaintNode]
-    constants: Table[BiggestInt, TaintNode]
-    variables: Table[PSym, TaintNode]
-      # Only one node for now, change back to Table[NodeKey, TaintNode]
-      # if smarter variable analysis is implemented
-      # Smarter variable analysis could simply assign
-      # an integer to each snippet of code in which a variable
-      # is an unchanged value, and then treat them as (variable+snippet_id)
-      # tuples for equality
+  TaintNode = Node[bool]
+    #|read |write|
+    #|false|false| implicit read or deactivated write
+    #                 maybeAliasing
+    #                 | \ | / |
+    #                 \__d(x)_/
+    #                 This occurs when joining paths in which one wrote x but the other one
+    #                 didn't. This is the same as implicitlyRead and can exist as a leaf too.
+    #|true |false| explicitly read
+    #                 maybeAliasing
+    #                 | \ | / |
+    #                 \__r(x)_/
+    #                 / / | \ \
+    #                 maybeAliased
+    #|false|true | explicitly written
+    #                 maybeAliasing
+    #                 | \ | / |
+    #                 \__r(x)_/
+    #                   / | \
+    #                 defAliased
+    #|true |true | written and then read from
+
+  # Smarter variable analysis could simply assign
+  # an integer to each snippet of code in which a variable
+  # is an unchanged value, and then treat them as (variable+snippet_id)
+  # tuples for equality
 
   TaintTree = object
     # Example taint tree:
@@ -45,6 +36,9 @@ type
     # A taint tree also only needs to support insertion, no removal.
     writeRoot: TaintNode
     readRoot: TaintNode
+
+template taint(n: TaintNode): bool = n.data
+template `taint=`(n: TaintNode, b: bool) = n.data = b
 
 func taintRead(hs: var TaintTree, loc: PNode) =
   let path = nodesToPath(collectImportantNodes(loc))
@@ -228,7 +222,7 @@ proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
 
 func copy(n: TaintNode): TaintNode =
   result = TaintNode(
-    taint: n.taint,
+    data: n.taint,
     fields: n.fields,
     constants: n.constants,
     variables: n.variables
@@ -286,3 +280,45 @@ proc `$`(t: TaintTree): string =
 
   result = debugNode(0, NodeKey(kind: field), t.readRoot, t.writeRoot)
 
+proc depthFirstTraversal(t: TaintTree ,
+                         op: proc (r, w: TaintNode, path: seq[NodeKey])) =
+  proc depthFirstTraversalAux(lvl: int, path: seq[NodeKey], r, w: TaintNode,
+                              op: proc (r, w: TaintNode, path: seq[NodeKey])) =
+    if r != nil or w != nil:
+      if lvl == 0:
+        discard # root
+      else:
+        op(r, w, path)
+
+      var
+        allFields: HashSet[PSym]
+        allConsts: HashSet[BiggestInt]
+        allVars: HashSet[PSym]
+      if r != nil:
+        allFields.incl r.fields.keys.toSeq.toHashSet
+        allConsts.incl r.constants.keys.toSeq.toHashSet
+        allVars.incl r.variables.keys.toSeq.toHashSet
+      if w != nil:
+        allFields.incl w.fields.keys.toSeq.toHashSet
+        allConsts.incl w.constants.keys.toSeq.toHashSet
+        allVars.incl w.variables.keys.toSeq.toHashSet
+
+      for k in allFields:
+        depthFirstTraversalAux(lvl+1, path & NodeKey(kind: field, field: k),
+          if r != nil and k in r.fields: r.fields[k] else: nil,
+          if w != nil and k in w.fields: w.fields[k] else: nil,
+          op)
+
+      for k in allConsts:
+        depthFirstTraversalAux(lvl+1, path & NodeKey(kind: constant, constant: k),
+          if r != nil and k in r.constants: r.constants[k] else: nil,
+          if w != nil and k in w.constants: w.constants[k] else: nil,
+          op)
+
+      for k in allVars:
+        depthFirstTraversalAux(lvl+1, path & NodeKey(kind: variable, variable: k),
+          if r != nil and k in r.variables: r.variables[k] else: nil,
+          if w != nil and k in w.variables: w.variables[k] else: nil,
+          op)
+
+  depthFirstTraversalAux(0, @[], t.readRoot, t.writeRoot, op)

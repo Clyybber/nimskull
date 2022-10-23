@@ -1,4 +1,3 @@
-
 type
   NodeKeyKind = enum
     field, constant, variable
@@ -50,19 +49,10 @@ type
     # This is a set because the same location
     # could be read in different instructions
     data: T
-    case kind: NodeKind
-    of Leaf:
-      # an atom (int, float etc)
-      discard
-    of Object:
-      ## only statically indexable via syms aka fields
-      #allFields: HashSet[PSym]
-      fields: Table[PSym, Node[T]]
-    of Array, # indexable statically and dynamically within static bounds
-       Infinite: # indexable statically and dynamically without any bounds
-      #extent: Slice[BiggestInt]
-      constants: Table[BiggestInt, Node[T]]
-      variables: Table[PSym, Node[T]]
+    kind: NodeKind
+    fields: Table[PSym, Node[T]]
+    constants: Table[BiggestInt, Node[T]]
+    variables: Table[PSym, Node[T]]
 
   SetNode = Node[IntSet]
 
@@ -97,7 +87,7 @@ proc typeToKind(typ: PType): NodeKind =
     tyPointer, tyRange, tySet, tyEnum, tyBool, tyChar, tyProc:
     result = Leaf
   else:
-    debug typ
+    #debug typ
     doAssert false, $typ.kind
 
 proc nodeToNode(n: PNode): SetNode =
@@ -171,24 +161,28 @@ func childrenLen(n: SetNode): int =
   of Array, Infinite:
     n.constants.len + n.variables.len
 
+func copyIntSet(s: IntSet): IntSet =
+  # IntSets do a stupid shallowcopy without this
+  assign(result, s)
+
 func copy(n: SetNode): SetNode =
   case n.kind:
   of Leaf:
-    result = SetNode(data: n.instructions, kind: Leaf)
+    result = SetNode(data: copyIntSet(n.instructions), kind: Leaf)
   of Object:
-    result = SetNode(data: n.instructions, kind: Object,
+    result = SetNode(data: copyIntSet(n.instructions), kind: Object,
                   fields: n.fields)
     for child in result.fields.mvalues:
       child = copy(child)
   of Array:
-    result = SetNode(data: n.instructions, kind: Array,
+    result = SetNode(data: copyIntSet(n.instructions), kind: Array,
                   constants: n.constants, variables: n.variables)
     for child in result.constants.mvalues:
       child = copy(child)
     for child in result.variables.mvalues:
       child = copy(child)
   of Infinite:
-    result = SetNode(data: n.instructions, kind: Infinite,
+    result = SetNode(data: copyIntSet(n.instructions), kind: Infinite,
                   constants: n.constants, variables: n.variables)
     for child in result.constants.mvalues:
       child = copy(child)
@@ -312,11 +306,10 @@ func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
   discard excl(hs.root, b.root)
 
 
-func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+func exclDefinitelyAliased(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
   result = HierarchicalSet(root: SetNode(kind: Object))
   var lastRef = @[hs.root] #TODO Rename, is a sequence because construction needs the kinds,
                            # could be a single lastRef and a list of kinds too
-  let path = nodesToPath(collectImportantNodes(loc))
   lastRef.setLen path.len
   for i in 0..<path.len-1:
     let nodeKey = path[i]
@@ -360,13 +353,15 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet
     popLocLeaf(constants)
   of variable: discard # not definitely aliased
 
+func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+  exclDefinitelyAliased(hs, nodesToPath(collectImportantNodes(loc)))
+
 type BackLastRef = object
   node: SetNode
   key: NodeKey
   parent: int
 
-func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
-  let path = nodesToPath(collectImportantNodes(loc))
+func exclMaybeAliased(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
   var lastRefs = @[@[BackLastRef(node: hs.root)]]
   lastRefs.setLen path.len
   for idx in 0..<path.len-1:
@@ -468,12 +463,14 @@ func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
   else:
     result = HierarchicalSet(root: SetNode(kind: Object))
 
-func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+  exclMaybeAliased(hs, nodesToPath(collectImportantNodes(loc)))
+
+func exclMaybeAliasing(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
   result = HierarchicalSet(root: SetNode(kind: Object))
   var resLastRefs = @[result.root]
 
   var lastRefs = @[hs.root]
-  let path = nodesToPath(collectImportantNodes(loc))
   for j in 0..<path.len:
     let nodeKey = path[j]
 
@@ -573,7 +570,8 @@ func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
       lastRefs = nextLastRefs
       resLastRefs = nextResLastRefs
 
-
+func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+  exclMaybeAliasing(hs, nodesToPath(collectImportantNodes(loc)))
 
 # Remove loc from the set means to empty it's instruction set
 # It may still serve as a path to other locs
@@ -653,3 +651,33 @@ proc reprHS(hs: HierarchicalSet): string =
 proc debugA(hs: HierarchicalSet): HierarchicalSet =
   echo reprHS hs
   hs
+
+func shiftedCopy(s: IntSet, shift: int): IntSet =
+  for i in s:
+    result.incl i + shift
+
+func shiftedCopy(n: SetNode, shift: int): SetNode =
+  case n.kind:
+  of Leaf:
+    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Leaf)
+  of Object:
+    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Object,
+                  fields: n.fields)
+    for child in result.fields.mvalues:
+      child = copy(child)
+  of Array:
+    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Array,
+                  constants: n.constants, variables: n.variables)
+    for child in result.constants.mvalues:
+      child = copy(child)
+    for child in result.variables.mvalues:
+      child = copy(child)
+  of Infinite:
+    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Infinite,
+                  constants: n.constants, variables: n.variables)
+    for child in result.constants.mvalues:
+      child = copy(child)
+    for child in result.variables.mvalues:
+      child = copy(child)
+
+func shiftedCopy(hs: HierarchicalSet, shift: int): HierarchicalSet = HierarchicalSet(root: shiftedCopy(hs.root, shift))
