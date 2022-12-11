@@ -123,81 +123,6 @@ include compiler/sem/dfa/hierarchical_set
 
 include compiler/sem/dfa/taint_tree
 
-# proc debugTaints(cfg: ControlFlowGraph, start = 0, stop = cfg.len) =
-#   type State = ref object
-#     taintTree: TaintTree
-
-#   func mergeStates(cfg: ControlFlowGraph, a: var State, b: sink State) =
-#     if a == nil:
-#       a = b
-#     else:
-#       cfg.mergeTaintTrees a.taintTree, b.taintTree
-
-#   var states = newSeq[State](cfg.len + 1)
-#   states[start] = State(taintTree: TaintTree(readRoot: TaintNode(), writeRoot: TaintNode()))
-
-#   for pc in start..<stop:
-#     template state: State = states[pc]
-#     if state != nil:
-#       dbg:
-#         echo "pc:",pc
-#         echo "taintTree:", $state.taintTree
-#       case cfg[pc].kind
-#       of def:
-#         state.taintTree.taintWrite cfg[pc].n
-
-#         cfg.mergeStates(states[pc + 1], move(states[pc]))
-#       of use:
-#         state.taintTree.taintRead cfg[pc].n
-
-#         cfg.mergeStates(states[pc + 1], move(states[pc]))
-#       of goto:
-#         cfg.mergeStates(states[pc + cfg[pc].dest], move(states[pc]))
-#       of fork:
-#         var copy = State(
-#           taintTree: copy(state.taintTree)
-#         )
-
-#         cfg.mergeStates(states[pc + cfg[pc].dest], copy)
-#         cfg.mergeStates(states[pc + 1], move(states[pc]))
-#       of cachew, cacher: # Skip; not handled
-#         cfg.mergeStates(states[pc + 1], move(states[pc]))
-
-# func applyTaintTree(cfg: ControlFlowGraph, s: var HierarchicalSet, t: TaintTree):
-#   tuple[lastReads, notLastReads: HierarchicalSet] =
-
-#   proc applyTaintTreeAux(cfg: ControlFlowGraph, writeNode, readNode: TaintNode) =
-#     if writeNode.taint:
-#       discard
-
-
-# func applyPathCache(cfg: ControlFlowGraph, a: var State, c: PathCache) =
-#   if a == nil:
-#     a = State(
-#       lastReads: HierarchicalSet(root: Node(kind: Object)),
-#       potentialLastReads: HierarchicalSet(root: Node(kind: Object)),
-#       notLastReads: HierarchicalSet(root: Node(kind: Object)),
-#     )
-#   else:
-#     let (lastReads, notLastReads) = cfg.applyTaintTree(a.potentialLastReads, c.hull)
-#       # Modifies potentialLastReads already, no need to do that ourselves
-
-#     a.lastReads.incl lastReads # TaintTree
-#     a.notLastReads.incl notLastReads # TaintTree
-
-#     a.lastReads.incl c.lastReads
-
-#     a.potentialLastReads.incl c.potentialLastReads
-#     a.potentialLastReads.excl a.notLastReads # Is this unneccessary?
-#     a.potentialLastReads.excl c.notLastReads # it helps performance
-
-#     a.notLastReads.incl c.notLastReads
-
-#     # And if it is neccessary, then why not do
-#     # a.notLastReads.incl c.notLastReads
-#     # a.potentialLastReads.excl a.notLastReads
-#     # instead
-
 proc computeLastReads(cfg: ControlFlowGraph) =
 
   type
@@ -239,11 +164,6 @@ proc computeLastReads(cfg: ControlFlowGraph) =
     State(lastReads: copy s.lastReads,
           potentialLastReads: copy s.potentialLastReads,
           notLastReads: copy s.notLastReads)
-
-  func shiftedCopy(s: State, shift: int): State =
-    State(lastReads: shiftedCopy(s.lastReads, shift),
-          potentialLastReads: shiftedCopy(s.potentialLastReads, shift),
-          notLastReads: shiftedCopy(s.notLastReads, shift))
 
   func copy(c: PathCache): PathCache =
     PathCache(internalState: copy c.internalState,
@@ -357,8 +277,6 @@ proc computeLastReads(cfg: ControlFlowGraph) =
           cfg[i].n.comment = '\n' & $pc
 
         state.potentialLastReads.incl(cfg[pc].n, pc)
-        # OFFSETHACK:
-        # state.potentialLastReads.incl(cfg[pc].n, pc + cfg[pc].offset)
 
         # Cache read:
         for i in 0..<pathCaches[pc].len:
@@ -407,32 +325,16 @@ proc computeLastReads(cfg: ControlFlowGraph) =
                 newNotLastReads.incl state.potentialLastReads.exclMaybeAliased(path)
                 state.notLastReads.incl newNotLastReads
           )
-          cfg.mergeStates(
-            states[exit],
-            # TODO: I don't think a shifted copy is neccessary. It doesn't hurt though, so
-            # get it working first and then replace it by a normal copy
-            # It actually does hurt since we don't do the lastReadTable stuff anymore
-            copy(pathCache.internalState))#, pc - finishedCaches[cfg[pc].dest].start))
+          cfg.mergeStates(states[exit], copy(pathCache.internalState))
 
-        let dest = pc + finishedCaches[cfg[pc].dest].stop - finishedCaches[cfg[pc].dest].start
-        #let dest = pc + 1
+        let dest = pc + 1
         handleCache(dest)
         cfg.mergeStates(states[dest], move state)
 
   let lastReads = (states[^1].lastReads.toIntSet + states[^1].potentialLastReads.toIntSet) -
                    states[^1].notLastReads.toIntSet
-  # var lastReadTable: Table[PNode, seq[int]]
-  # for position, node in cfg:
-  #   if node.kind == use:
-  #     lastReadTable.mgetOrPut(node.n, @[]).add position
-  # for node, positions in lastReadTable:
-  #   block checkIfAllPosLastRead:
-  #     for p in positions:
-  #       if p notin lastReads: break checkIfAllPosLastRead
-  #     node.flags.incl nfLastRead
-  for position, node in cfg:
-    if node.kind == use and position in lastReads:
-      node.n.flags.incl nfLastRead
+  for position in lastReads:
+    cfg[position].n.flags.incl nfLastRead
 
 proc computeFirstWrites(cfg: ControlFlowGraph) =
 
@@ -519,45 +421,4 @@ proc computeLastReadsAndFirstWrites*(cfg: ControlFlowGraph) =
   preprocessCfg(cfg)
   computeLastReads(cfg)
   computeFirstWrites(cfg)
-  #dbg:
-  #debugTaints(cfg)
-
-when false:
-  proc initialized*(code: ControlFlowGraph; pc: int,
-                   init, uninit: var IntSet; until: int): int =
-    ## Computes the set of definitely initialized variables across all code paths
-    ## as an IntSet of IDs.
-    var pc = pc
-    while pc < code.len:
-      case code[pc].kind
-      of goto:
-        pc += code[pc].dest
-      of fork:
-        var initA = initIntSet()
-        var initB = initIntSet()
-        var variantA = pc + 1
-        var variantB = pc + code[pc].dest
-        while variantA != variantB:
-          if max(variantA, variantB) > until:
-            break
-          if variantA < variantB:
-            variantA = initialized(code, variantA, initA, uninit, min(variantB, until))
-          else:
-            variantB = initialized(code, variantB, initB, uninit, min(variantA, until))
-        pc = min(variantA, variantB)
-        # we add vars if they are in both branches:
-        for v in initA:
-          if v in initB:
-            init.incl v
-      of use:
-        let v = code[pc].n.sym
-        if v.kind != skParam and v.id notin init:
-          # attempt to read an uninit'ed variable
-          uninit.incl v.id
-        inc pc
-      of def:
-        let v = code[pc].n.sym
-        init.incl v.id
-        inc pc
-    return pc
 

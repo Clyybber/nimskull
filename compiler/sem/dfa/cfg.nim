@@ -337,105 +337,88 @@ proc isTrue(n: PNode): bool =
   n.kind == nkSym and n.sym.kind == skEnumField and n.sym.position != 0 or
     n.kind == nkIntLit and n.intVal != 0
 
-when true:
-  proc genWhile(c: var Con; n: PNode) =
-    # We unroll every loop 3 times. We emulate 0, 1, 2 iterations
-    # through the loop. We need to prove this is correct for our
-    # purposes. But Herb Sutter claims it is. (Proof by authority.)
-    #
-    # EDIT: Actually, we only need to unroll 2 times
-    # because Nim doesn't have a way of breaking/goto-ing into
-    # a loop iteration. Unrolling 2 times is much better for compile
-    # times of nested loops than 3 times, so we do that here.
-    #[
-    while cond:
+proc genWhile(c: var Con; n: PNode) =
+  # We unroll every loop 3 times. We emulate 0, 1, 2 iterations
+  # through the loop. We need to prove this is correct for our
+  # purposes. But Herb Sutter claims it is. (Proof by authority.)
+  #
+  # EDIT: Actually, we only need to unroll 2 times
+  # because Nim doesn't have a way of breaking/goto-ing into
+  # a loop iteration. Unrolling 2 times is much better for compile
+  # times of nested loops than 3 times, so we do that here.
+  #[
+  while cond:
+    body
+
+  Becomes:
+
+  block:
+    if cond:
       body
-
-    Becomes:
-
-    block:
       if cond:
         body
         if cond:
           body
-          if cond:
-            body
 
-    We still need to ensure 'break' resolves properly, so an AST to AST
-    translation is impossible.
+  We still need to ensure 'break' resolves properly, so an AST to AST
+  translation is impossible.
 
-    So the code to generate is:
+  So the code to generate is:
 
-      cond
-      fork L4  # F1
-      body
-      cond
-      fork L5  # F2
-      body
-      cond
-      fork L6  # F3
-      body
-    L6:
-      join F3
-    L5:
-      join F2
-    L4:
-      join F1
-    ]#
+    cond
+    fork L4  # F1
+    body
+    cond
+    fork L5  # F2
+    body
+    cond
+    fork L6  # F3
+    body
+  L6:
+    join F3
+  L5:
+    join F2
+  L4:
+    join F1
+  ]#
+  withBlock(nil):
     if isTrue(n[0]):
       # 'while true' is an idiom in Nim and so we produce
       # better code for it:
-      withBlock(nil):
-        let firstCache = c.cachewI()
-        c.gen(n[1])
-        c.patch(firstCache)
-        c.code.add Instr(kind: cacher, dest: int firstCache)
-
-        let start = c.code.len
-        c.gen(n[1])
-        for i in start..<c.code.len:
-          c.code[i] = Instr(kind: goto, dest: 1)
-          # OFFSETHACK:
-          # if c.code[i].kind == use:
-          #   c.code[i].offset -= c.code.len - start
+      let firstCache = c.cachewI()
+      c.gen(n[1])
+      c.patch(firstCache)
+      c.code.add Instr(kind: cacher, dest: int firstCache)
     else:
-      withBlock(nil):
-        var endings: array[2, TPosition]
-        c.gen(n[0])
-        endings[0] = c.forkI()
-        let firstCache = c.cachewI()
-        c.gen(n[1])
-        c.patch(firstCache)
-        c.gen(n[0])
-        endings[1] = c.forkI()
-        c.code.add Instr(kind: cacher, dest: int firstCache)
+      var firstIterExit, secondIterExit: TPosition
+      c.gen(n[0])
+      firstIterExit = c.forkI()
+      let firstCache = c.cachewI()
+      c.gen(n[1])
+      c.patch(firstCache)
+      c.gen(n[0])
+      secondIterExit = c.forkI()
+      c.code.add Instr(kind: cacher, dest: int firstCache)
+      c.patch(secondIterExit)
+      c.patch(firstIterExit)
 
-        let start = c.code.len
-        c.gen(n[1]) # Remove this
-        for i in start..<c.code.len:
-          c.code[i] = Instr(kind: goto, dest: 1)
-
-        c.patch(endings[1])
-        c.patch(endings[0])
-
-else:
-  proc genWhile(c: var Con; n: PNode) =
-    # lab1:
-    #   cond, tmp
-    #   fork tmp, lab2
-    #   body
-    #   jmp lab1
-    # lab2:
-    let lab1 = c.genLabel
-    withBlock(nil):
-      if isTrue(n[0]):
-        c.gen(n[1])
-        c.jmpBack(lab1)
-      else:
-        c.gen(n[0])
-        forkT(n):
-          c.gen(n[1])
-          c.jmpBack(lab1)
+# proc genWhile(c: var Con; n: PNode) =
+#   # lab1:
+#   #   cond, tmp
+#   #   fork tmp, lab2
+#   #   body
+#   #   jmp lab1
+#   # lab2:
+#   let lab1 = c.genLabel
+#   withBlock(nil):
+#     if isTrue(n[0]):
+#       c.gen(n[1])
+#       c.jmpBack(lab1)
+#     else:
+#       c.gen(n[0])
+#       forkT(n):
+#         c.gen(n[1])
+#         c.jmpBack(lab1)
 
 template forkT(n, body) =
   let lab1 = c.forkI()

@@ -651,33 +651,3 @@ proc reprHS(hs: HierarchicalSet): string =
 proc debugA(hs: HierarchicalSet): HierarchicalSet =
   echo reprHS hs
   hs
-
-func shiftedCopy(s: IntSet, shift: int): IntSet =
-  for i in s:
-    result.incl i + shift
-
-func shiftedCopy(n: SetNode, shift: int): SetNode =
-  case n.kind:
-  of Leaf:
-    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Leaf)
-  of Object:
-    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Object,
-                  fields: n.fields)
-    for child in result.fields.mvalues:
-      child = copy(child)
-  of Array:
-    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Array,
-                  constants: n.constants, variables: n.variables)
-    for child in result.constants.mvalues:
-      child = copy(child)
-    for child in result.variables.mvalues:
-      child = copy(child)
-  of Infinite:
-    result = SetNode(data: shiftedCopy(n.instructions, shift), kind: Infinite,
-                  constants: n.constants, variables: n.variables)
-    for child in result.constants.mvalues:
-      child = copy(child)
-    for child in result.variables.mvalues:
-      child = copy(child)
-
-func shiftedCopy(hs: HierarchicalSet, shift: int): HierarchicalSet = HierarchicalSet(root: shiftedCopy(hs.root, shift))
