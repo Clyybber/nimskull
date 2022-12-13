@@ -1,5 +1,22 @@
+import
+  std/[
+    intsets,
+    strutils,
+    tables,
+    sets
+  ],
+  compiler/ast/[
+    ast
+  ],
+  compiler/sem/dfa/[
+    cfg,
+    setnode
+  ]
+
+from sequtils import toSeq
+
 type
-  TaintNode = Node[bool]
+  TaintNode* = Node[bool]
     #|read |write|
     #|false|false| implicit read or deactivated write
     #                 maybeAliasing
@@ -26,7 +43,7 @@ type
   # is an unchanged value, and then treat them as (variable+snippet_id)
   # tuples for equality
 
-  TaintTree = object
+  TaintTree* = object
     # Example taint tree:
     #            root
     #       s            t
@@ -34,13 +51,13 @@ type
     # Child nodes always taint their parents
     # as read implicitly (without their taintkind actually reflecting it)
     # A taint tree also only needs to support insertion, no removal.
-    writeRoot: TaintNode
-    readRoot: TaintNode
+    writeRoot*: TaintNode
+    readRoot*: TaintNode
 
 template taint(n: TaintNode): bool = n.data
 template `taint=`(n: TaintNode, b: bool) = n.data = b
 
-func taintRead(hs: var TaintTree, loc: PNode) =
+func taintRead*(hs: var TaintTree, loc: PNode) =
   let path = nodesToPath(collectImportantNodes(loc))
 
   # First check if dominated by write
@@ -92,7 +109,7 @@ func taintRead(hs: var TaintTree, loc: PNode) =
   #                                                #because then we get deactivated writes too
   #   writeLastRef.taint = false
 
-func taintWrite(hs: var TaintTree, loc: PNode) =
+func taintWrite*(hs: var TaintTree, loc: PNode) =
   let path = nodesToPath(collectImportantNodes(loc))
 
   # First check if dominated by read
@@ -142,7 +159,7 @@ func taintWrite(hs: var TaintTree, loc: PNode) =
 func len(n: TaintNode): int =
   n.fields.len + n.constants.len + n.variables.len
 
-proc mergeTaintTrees(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
+proc mergeTaintTrees*(cfg: ControlFlowGraph, a: var TaintTree, b: TaintTree) =
   # merge
   #   {w(s[1])} with {}
   # must still exclMaybeAliasing(s[1]) but
@@ -234,7 +251,7 @@ func copy(n: TaintNode): TaintNode =
   for child in result.variables.mvalues:
     child = copy(child)
 
-func copy(t: TaintTree): TaintTree = TaintTree(readRoot: copy(t.readRoot), writeRoot: copy(t.writeRoot))
+func copy*(t: TaintTree): TaintTree = TaintTree(readRoot: copy(t.readRoot), writeRoot: copy(t.writeRoot))
 
 proc `$`(t: TaintTree): string =
   proc debugNode(lvl: int, key: NodeKey, r, w: TaintNode): string =
@@ -243,7 +260,7 @@ proc `$`(t: TaintTree): string =
       if lvl == 0:
         result.add "root"
       else:
-        result.add reprNodeKey key
+        result.add $key
       if r != nil:
         result.add " r(" & $r.taint & ")"
       if w != nil:
@@ -280,7 +297,7 @@ proc `$`(t: TaintTree): string =
 
   result = debugNode(0, NodeKey(kind: field), t.readRoot, t.writeRoot)
 
-proc depthFirstTraversal(t: TaintTree ,
+proc depthFirstTraversal*(t: TaintTree ,
                          op: proc (r, w: TaintNode, path: seq[NodeKey])) =
   proc depthFirstTraversalAux(lvl: int, path: seq[NodeKey], r, w: TaintNode,
                               op: proc (r, w: TaintNode, path: seq[NodeKey])) =

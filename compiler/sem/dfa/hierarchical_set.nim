@@ -1,77 +1,27 @@
-type
-  NodeKeyKind = enum
-    field, constant, variable
-  NodeKey = object
-    case kind: NodeKeyKind
-    of field:
-      field: PSym
-    of constant:
-      constant: BiggestInt
-    of variable:
-      variable: PSym
+import
+  std/[
+    intsets,
+    strutils,
+    tables,
+    sets
+  ],
+  compiler/ast/[
+    ast
+  ],
+  compiler/sem/dfa/[
+    cfg,
+    setnode
+  ]
 
-proc hash(s: PSym): Hash = hash(cast[pointer](s))
-
-proc hash(k: NodeKey): Hash =
-  result = result !& hash(k.kind)
-  case k.kind
-  of field:
-    result = result !& hash(k.field)
-  of constant:
-    result = result !& hash(k.constant)
-  of variable:
-    result = result !& hash(k.variable)
-  result = !$result
-
-proc `==`(a, b: NodeKey): bool =
-  if a.kind != b.kind:
-    false
-  else:
-    case a.kind
-    of field:
-      b.field == b.field
-    of constant:
-      b.constant == b.constant
-    of variable:
-      b.variable == b.variable
+from sequtils import toSeq
 
 type
-  NodeKind = enum
-    Leaf
-    Object
-    Array
-    Infinite
-  Node[T] = ref object
-    # we need a way to differentiate
-    # between a node simply serving as a path to a
-    # subnode, or being a node itself. For now we
-    # just check if instructions is empty.
-    # This is a set because the same location
-    # could be read in different instructions
-    data: T
-    kind: NodeKind
-    fields: Table[PSym, Node[T]]
-    constants: Table[BiggestInt, Node[T]]
-    variables: Table[PSym, Node[T]]
+  SetNode* = Node[IntSet]
 
-  SetNode = Node[IntSet]
-
-  HierarchicalSet = object
-    root: SetNode
+  HierarchicalSet* = object
+    root*: SetNode
 
 template instructions(n: SetNode): IntSet = n.data
-
-import compiler/utils/astrepr
-
-proc hash(n: PNode): Hash = hash(cast[pointer](n))
-
-proc typeOfNode(n: PNode): PType =
-  const skipped = {tyAlias, tyDistinct, tyGenericInst,
-    tyRef, tyPtr, tyVar, tySink, tyLent, tyOwned}
-  result = n.typ.skipTypes(skipped)
-  # HACK: sometimes typ is tyUntyped, in that case we try to get the sym typ instead
-  if result.kind == tyUntyped and n.kind == nkSym:
-    result = n.sym.typ.skipTypes(skipped)
 
 proc typeToKind(typ: PType): NodeKind =
   case typ.kind
@@ -87,71 +37,11 @@ proc typeToKind(typ: PType): NodeKind =
     tyPointer, tyRange, tySet, tyEnum, tyBool, tyChar, tyProc:
     result = Leaf
   else:
-    #debug typ
     doAssert false, $typ.kind
 
 proc nodeToNode(n: PNode): SetNode =
   let typ = typeOfNode(n)
   result = SetNode(kind: typeToKind(typ))
-    
-from sequtils import toSeq
-from compiler/ast/typesrenderer import `$`
-
-func collectImportantNodes(n: PNode): seq[PNode] =
-  var n = n
-  while true:
-    case n.kind
-    of PathKinds0 - {nkDotExpr, nkBracketExpr}:
-      n = n[0]
-    of PathKinds1:
-      n = n[1]
-    of nkDotExpr, nkBracketExpr:
-      result.add n
-      n = n[0]
-    of nkSym:
-      result.add n; break
-    else:
-      doAssert false, "unreachable" # is it?
-
-var fakeTupleIndexSyms: seq[PSym]
-
-func nodesToPath(importantNodes: seq[PNode]): seq[NodeKey] =
-  for i in countdown(importantNodes.len-1, 0):
-    let n = importantNodes[i]
-
-    case n.kind
-    of nkDotExpr:
-      doAssert n[1].kind == nkSym
-      result.add NodeKey(kind: field, field: n[1].sym)
-    of nkBracketExpr:
-      let typ = typeOfNode(n[0])
-      if typ.kind == tyTuple: # Indexing a tuple
-        # hack because sem doesn't transform tup[X] to tup.field_X
-        if typ.n != nil:
-          result.add NodeKey(kind: field, field: typ.n.sons[n[1].intVal].sym)
-        else: # Unnamed tuple fields
-          {.cast(noSideEffect).}:
-            if fakeTupleIndexSyms.len < n[1].intVal + 1:
-              fakeTupleIndexSyms.setLen n[1].intVal + 1
-            if fakeTupleIndexSyms[n[1].intVal] == nil:
-              fakeTupleIndexSyms[n[1].intVal] =
-                newSym(skField, nil,
-                       ItemId() #[nextSymId c.idgen]#, nil, n[1].info)
-            result.add NodeKey(kind: field, field: fakeTupleIndexSyms[n[1].intVal])
-      else:
-        result.add if n[1].kind in nkLiterals:
-                     NodeKey(kind: constant, constant: n[1].intVal)
-                   else:
-                     NodeKey(kind: variable, variable: nil)
-                       # Could be a sym or a call
-                       # but currently all variables treated as one (nil)
-    of nkSym:
-      # A "field" of the stack/environment
-      result.add NodeKey(kind: field, field: n.sym)
-
-    else: doAssert false, "unreachable"
-
-  #debugEcho result
 
 func childrenLen(n: SetNode): int =
   case n.kind:
@@ -189,9 +79,9 @@ func copy(n: SetNode): SetNode =
     for child in result.variables.mvalues:
       child = copy(child)
 
-func copy(hs: HierarchicalSet): HierarchicalSet = HierarchicalSet(root: copy(hs.root))
+func copy*(hs: HierarchicalSet): HierarchicalSet = HierarchicalSet(root: copy(hs.root))
 
-func toIntSet(hs: HierarchicalSet): IntSet =
+func toIntSet*(hs: HierarchicalSet): IntSet =
   func toIntSetAux(node: SetNode, result: var IntSet) =
     result.incl node.instructions
     case node.kind
@@ -207,7 +97,7 @@ func toIntSet(hs: HierarchicalSet): IntSet =
 
   toIntSetAux(hs.root, result)
 
-func incl(hs: var HierarchicalSet, loc: PNode, instr: int) =
+func incl*(hs: var HierarchicalSet, loc: PNode, instr: int) =
   var lastRef = hs.root
   let parts = collectImportantNodes(loc)
   let path = nodesToPath(parts)
@@ -227,6 +117,11 @@ func incl(hs: var HierarchicalSet, loc: PNode, instr: int) =
       traverseOrCreate(lastRef.variables, nodeKey.variable)
 
   lastRef.instructions.incl instr
+
+# Remove loc from the set means to empty it's instruction set
+# It may still serve as a path to other locs
+# GC loc from the set means to actually remove the node from it,
+# which is possible if the node has no instructions and no children.
 
 func excl(hs: var HierarchicalSet, loc: PNode, instr: int) =
   # A single instruction int can only correspond to one location PNode
@@ -254,7 +149,7 @@ func excl(hs: var HierarchicalSet, loc: PNode, instr: int) =
   #   #  Remove it from it's parent, and for the parent of the parent if needed
 
 
-func incl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
+func incl*(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
   func incl(a, b: SetNode) =
     a.instructions.incl b.instructions
     template inclOrCreate(achilds, bchilds) =
@@ -278,7 +173,7 @@ func incl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
   incl(hs.root, b.root)
 
 
-func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
+func excl*(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
   func excl(a, b: SetNode): bool =
     result = true
     a.instructions.excl b.instructions
@@ -306,7 +201,7 @@ func excl(cfg: ControlFlowGraph, hs: var HierarchicalSet, b: HierarchicalSet) =
   discard excl(hs.root, b.root)
 
 
-func exclDefinitelyAliased(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
+func exclDefinitelyAliased*(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
   result = HierarchicalSet(root: SetNode(kind: Object))
   var lastRef = @[hs.root] #TODO Rename, is a sequence because construction needs the kinds,
                            # could be a single lastRef and a list of kinds too
@@ -353,7 +248,7 @@ func exclDefinitelyAliased(hs: var HierarchicalSet, path: seq[NodeKey]): Hierarc
     popLocLeaf(constants)
   of variable: discard # not definitely aliased
 
-func exclDefinitelyAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+func exclDefinitelyAliased*(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
   exclDefinitelyAliased(hs, nodesToPath(collectImportantNodes(loc)))
 
 type BackLastRef = object
@@ -361,7 +256,7 @@ type BackLastRef = object
   key: NodeKey
   parent: int
 
-func exclMaybeAliased(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
+func exclMaybeAliased*(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
   var lastRefs = @[@[BackLastRef(node: hs.root)]]
   lastRefs.setLen path.len
   for idx in 0..<path.len-1:
@@ -463,10 +358,10 @@ func exclMaybeAliased(hs: var HierarchicalSet, path: seq[NodeKey]): Hierarchical
   else:
     result = HierarchicalSet(root: SetNode(kind: Object))
 
-func exclMaybeAliased(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+func exclMaybeAliased*(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
   exclMaybeAliased(hs, nodesToPath(collectImportantNodes(loc)))
 
-func exclMaybeAliasing(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
+func exclMaybeAliasing*(hs: var HierarchicalSet, path: seq[NodeKey]): HierarchicalSet =
   result = HierarchicalSet(root: SetNode(kind: Object))
   var resLastRefs = @[result.root]
 
@@ -570,64 +465,16 @@ func exclMaybeAliasing(hs: var HierarchicalSet, path: seq[NodeKey]): Hierarchica
       lastRefs = nextLastRefs
       resLastRefs = nextResLastRefs
 
-func exclMaybeAliasing(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
+func exclMaybeAliasing*(hs: var HierarchicalSet, loc: PNode): HierarchicalSet =
   exclMaybeAliasing(hs, nodesToPath(collectImportantNodes(loc)))
 
-# Remove loc from the set means to empty it's instruction set
-# It may still serve as a path to other locs
-# GC loc from the set means to actually remove the node from it,
-# which is possible if the node has no instructions and no children.
-
-#def:
-#  potentialLastReads.excl:
-#    lastReads.incl:
-#      all definitely aliased by the def loc (exclDefinitelyAliased)
-#    notLastReads.incl:
-#      all that would maybe alias the def loc (exclmaybeAliasing)
-#use:
-#  potentialLastReads.excl:
-#    notLastReads.incl:
-#      all maybe aliased by the use loc (exclMaybeAliased)
-#      all that would maybe alias the use loc (exclmaybeAliasing)
-#  potentialLastReads.incl:
-#    the use loc
-#merge:
-#  lastReads = a.lastReads + b.lastReads
-#  potentialLastReads = (a.potentialLastReads + b.potentialLastReads) - (a.notLastReads + b.notLastReads)
-#  notLastReads = a.notLastReads + b.notLastReads
-#  alreadySeen = a.alreadySeen + b.alreadySeen
-#finalize:
-#  lastReads = (states[^1].lastReads + states[^1].potentialLastReads) - states[^1].notLastReads
-#  
-#  var lastReadTable: Table[PNode, seq[int]]
-#  for position, node in cfg:
-#    if node.kind == use:
-#      lastReadTable.mgetOrPut(node.n, @[]).add position
-#  for node, positions in lastReadTable:
-#    block checkIfAllPosLastRead:
-#      for p in positions:
-#        if p notin lastReads: break checkIfAllPosLastRead
-#      node.flags.incl nfLastRead
-
-template incl(a, b) = cfg.incl(a, b)
-template excl(a, b) = cfg.excl(a, b)
-
-proc reprNodeKey(k: NodeKey): string =
-  case k.kind
-  of field:
-    $k.field
-  of constant:
-    $k.constant
-  of variable:
-    "var:" & $k.variable
-
-proc reprHS(hs: HierarchicalSet): string =
+proc `$`*(hs: HierarchicalSet): string =
   proc debugNode(lvl: int, key: NodeKey, n: SetNode): string =
     result.add repeat(' ', lvl)
     if lvl == 0:
       result.add "root"
     else:
-      result.add reprNodeKey key
+      result.add $key
     result.add " " & $n.kind & " " & $n.instructions
     result.add "\n"
 
@@ -648,6 +495,3 @@ proc reprHS(hs: HierarchicalSet): string =
 
   result = debugNode(0, NodeKey(kind: field), hs.root)
 
-proc debugA(hs: HierarchicalSet): HierarchicalSet =
-  echo reprHS hs
-  hs

@@ -1,21 +1,16 @@
 import
   std/[
     intsets,
-    strtabs,
-    strutils,
-    tables
+    tables,
+    sets,
+    hashes
   ],
   compiler/ast/[
     ast,
-    astalgo,
     renderer,
-    idents,
-    lineinfos,
     reports
   ],
-  compiler/modules/modulegraphs,
   compiler/front/[
-    msgs,
     options
   ],
   compiler/sem/dfa/cfg
@@ -28,9 +23,6 @@ template dbg*(body) =
   when toDebug.len > 0:
     if shouldDebug:
       body
-
-import sets, hashes
-
 
 proc skipConvDfa*(n: PNode): PNode =
   result = n
@@ -119,9 +111,10 @@ obj          field       alias kind
         result = maybe
     else: assert false # unreachable
 
-include compiler/sem/dfa/hierarchical_set
+import compiler/sem/dfa/[setnode, hierarchical_set, taint_tree]
 
-include compiler/sem/dfa/taint_tree
+template incl(a, b) = cfg.incl(a, b)
+template excl(a, b) = cfg.excl(a, b)
 
 proc computeLastReads(cfg: ControlFlowGraph) =
 
@@ -204,9 +197,9 @@ proc computeLastReads(cfg: ControlFlowGraph) =
     if state != nil:
       dbg:
         echo "pc:",pc
-        echo "lastReads:",reprHS(state.lastReads)
-        echo "potentialLastReads:",reprHS(state.potentialLastReads)
-        echo "notLastReads:",reprHS(state.notLastReads)
+        echo "lastReads:",state.lastReads
+        echo "potentialLastReads:",state.potentialLastReads
+        echo "notLastReads:",state.notLastReads
 
       template handleActiveCaches(pc) =
         for i in countdown(activeCaches.len-1, 0):
@@ -241,6 +234,13 @@ proc computeLastReads(cfg: ControlFlowGraph) =
       assert pathCaches[pc].len == activeCaches.len, $pathCaches[pc].len & "|" & $activeCaches.len
       case cfg[pc].kind
       of def:
+        #def:
+        #  potentialLastReads.excl:
+        #    lastReads.incl:
+        #      all definitely aliased by the def loc (exclDefinitelyAliased)
+        #    notLastReads.incl:
+        #      all that would maybe alias the def loc (exclmaybeAliasing)
+
         # the path leads to a redefinition of 's' --> sink 's'.
         let newLastReads = state.potentialLastReads.exclDefinitelyAliased(cfg[pc].n)
         state.lastReads.incl newLastReads
@@ -268,6 +268,14 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         handleCache(dest)
         cfg.mergeStates(states[dest], move state)
       of use:
+        #use:
+        #  potentialLastReads.excl:
+        #    notLastReads.incl:
+        #      all maybe aliased by the use loc (exclMaybeAliased)
+        #      all that would maybe alias the use loc (exclmaybeAliasing)
+        #  potentialLastReads.incl:
+        #    the use loc
+
         var newNotLastReads = state.potentialLastReads.exclMaybeAliased(cfg[pc].n)
         newNotLastReads.incl state.potentialLastReads.exclMaybeAliasing(cfg[pc].n)
 
@@ -299,7 +307,7 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         cfg.mergeStates(states[destA], copy state)
         cfg.mergeStates(states[destB], move state)
       of cachew:
-        dbg: echo "XXXXX:  adding cache", pc,"+",pc + cfg[pc].dest
+        dbg: echo "Adding cache: ",pc,"..",pc + cfg[pc].dest
         activeCaches.add Cache(start: pc, stop: pc + cfg[pc].dest)
         pathCaches[pc].add PathCache(
           internalState: newState(),
@@ -309,11 +317,10 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         cfg.mergeStates(states[dest], move state)
       of cacher:
         doAssert finishedCaches[cfg[pc].dest].start == cfg[pc].dest
-        dbg: echo "YYYYYYY: applying cache",pc,"+",cfg[pc].dest
+        dbg: echo "Applying cache at ",pc," from ",cfg[pc].dest
 
         for exit, pathCache in finishedCaches[cfg[pc].dest].exits:
-          dbg:
-            echo "haaaaa",exit,' ',pathCache.hull
+          dbg: echo "Applying pathCache to ",exit,":",pathCache.hull
           depthFirstTraversal(pathCache.hull,
             proc (r, w: TaintNode, path: seq[NodeKey]) =
               if w != nil and w.data:
@@ -336,6 +343,9 @@ proc computeLastReads(cfg: ControlFlowGraph) =
   for position in lastReads:
     cfg[position].n.flags.incl nfLastRead
 
+
+proc hash(n: PNode): Hash = hash(cast[pointer](n))
+
 proc computeFirstWrites(cfg: ControlFlowGraph) =
 
   type State = ref object
@@ -349,13 +359,6 @@ proc computeFirstWrites(cfg: ControlFlowGraph) =
       a = b
     else:
       a.alreadySeen.incl b.alreadySeen
-
-  var cache = initTable[(PNode, PNode), AliasKind]()
-  proc aliasesCached(obj, field: PNode): AliasKind =
-    let key = (obj, field)
-    if not cache.hasKey(key):
-      cache[key] = aliases(obj, field)
-    cache[key]
 
   var states = newSeq[State](cfg.len + 1)
   states[0] = State()
@@ -371,8 +374,8 @@ proc computeFirstWrites(cfg: ControlFlowGraph) =
         block firstTime:
           block alreadySeen:
             for s in state.alreadySeen:
-              if aliasesCached(cfg[pc].n, s) != no or
-                 aliasesCached(s, cfg[pc].n) != no:
+              if aliases(cfg[pc].n, s) != no or
+                 aliases(s, cfg[pc].n) != no:
                 break alreadySeen
             if pc > inLoopUntil:
               cfg[pc].n.flags.incl nfFirstWrite
