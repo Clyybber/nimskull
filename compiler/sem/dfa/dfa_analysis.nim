@@ -125,7 +125,7 @@ proc computeLastReads(cfg: ControlFlowGraph) =
       notLastReads: HierarchicalSet
 
     PathCache = object
-      # This captures the effect a section
+      # Captures the effect a section
       # of cfg code has, with a single start and exit
       internalState: State
         # Captures:
@@ -144,7 +144,7 @@ proc computeLastReads(cfg: ControlFlowGraph) =
 
     Cache = object
       exits: Table[int, PathCache]
-      start, stop: int
+      area: Slice[int]
 
   func newState: State =
     State(
@@ -186,11 +186,11 @@ proc computeLastReads(cfg: ControlFlowGraph) =
   var states = newSeq[State](cfg.len + 1)
   states[0] = newState()
 
-  var activeCaches: seq[Cache] # curr loop depth -> Cache
   var pathCaches: seq[seq[PathCache]] # pc -> curr loop depth -> PathCache
   pathCaches.setLen cfg.len + 1
-  var finishedCaches: seq[Cache] # cacher.dest -> Cache
-  finishedCaches.setLen cfg.len + 1
+  var finalCaches: seq[Cache] # cacher.dest -> Cache
+  finalCaches.setLen cfg.len + 1
+  var activeCaches: seq[Cache] # curr loop depth -> Cache
 
   for pc in 0..<cfg.len:
     template state: State = states[pc]
@@ -201,27 +201,28 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         echo "potentialLastReads:",state.potentialLastReads
         echo "notLastReads:",state.notLastReads
 
-      template handleActiveCaches(pc) =
+      block finalizeCaches:
         for i in countdown(activeCaches.len-1, 0):
-          if pc notin activeCaches[i].start..<activeCaches[i].stop:
-            dbg: echo "XXXXX:  removing cache",pc,"|",activeCaches[i].start,"+",activeCaches[i].stop
-            finishedCaches[activeCaches[i].start] = activeCaches[i]
+          if pc notin activeCaches[i].area:
+            dbg: echo "exiting and finalizing cache: ",pc,"|",activeCaches[i].area
+            finalCaches[activeCaches[i].area.a] = activeCaches[i]
             activeCaches.setLen activeCaches.len - 1
           else:
-            # Not leaving the cache, and since caches
-            # are nested, not leaving any others either
+            # caches are nested, so we aren't leaving any others beyond this point
             break
+
+      assert pathCaches[pc].len == activeCaches.len, $pathCaches[pc].len & "|" & $activeCaches.len
+
 
       template handleCache(dest) =
         for i in countdown(activeCaches.len-1, 0):
-          if dest notin activeCaches[i].start..<activeCaches[i].stop:
+          if dest notin activeCaches[i].area:
             activeCaches[i].exits[dest] = copy pathCaches[pc][i]
           else:
-            # Not leaving the cache, and since caches
-            # are nested, not leaving any others either
+            # caches are nested, so we aren't leaving any others beyond this point
             break
         for i in 0..<activeCaches.len:
-          if dest in activeCaches[i].start..<activeCaches[i].stop:
+          if dest in activeCaches[i].area:
             if i in 0..<pathCaches[dest].len:
               cfg.mergePathCaches(pathCaches[dest][i], copy pathCaches[pc][i])
             else:
@@ -230,36 +231,30 @@ proc computeLastReads(cfg: ControlFlowGraph) =
             break
         #dbg: echo "XXXXX:  move ",pathCaches[pc].len," from ",pc," to ",dest," making ",pathCaches[dest].len
 
-      handleActiveCaches(pc)
-      assert pathCaches[pc].len == activeCaches.len, $pathCaches[pc].len & "|" & $activeCaches.len
+
       case cfg[pc].kind
       of def:
-        #def:
-        #  potentialLastReads.excl:
-        #    lastReads.incl:
-        #      all definitely aliased by the def loc (exclDefinitelyAliased)
-        #    notLastReads.incl:
-        #      all that would maybe alias the def loc (exclmaybeAliasing)
-
-        # the path leads to a redefinition of 's' --> sink 's'.
         let newLastReads = state.potentialLastReads.exclDefinitelyAliased(cfg[pc].n)
         state.lastReads.incl newLastReads
+          #all definitely aliased by the def loc
+          #(path lead to a redefinition of 's' --> sink 's')
 
-        # only partially writes to 's' --> can't sink 's', so this def reads 's'
-        # or maybe writes to 's' --> can't sink 's'
-        # This "def reads 's'" matters for seq/ref, but if writes access to these
-        # is generated as a use s then maybe we could be more greedy here
-        # That def would however also excl maybe aliased not only maybe aliasing,
-        # so what would ultimately be best is to split the location s from s[].x..s[].y
-        # OTOH we cannot move from s[]... anyways since we don't own s[]...
         let newNotLastReads = state.potentialLastReads.exclMaybeAliasing(cfg[pc].n)
         state.notLastReads.incl newNotLastReads
+          #all that would maybe alias the def loc
+          #(partially writes to 's', so this def reads 's' or maybe writes to 's' --> can't sink 's')
+          # This "def reads 's'" matters for seq/ref, but if writes access to these
+          # is generated as a use s then maybe we could be more greedy here
+          # That def would however also excl maybe aliased not only maybe aliasing,
+          # so what would ultimately be best is to split the location s from s[].x..s[].y
+          # OTOH we cannot move from s[]... anyways since we don't own s[]...
 
         for i in toIntSet(newNotLastReads):
           cfg[i].n.comment = '\n' & $pc
 
         # Cache write:
-        for i in 0..<pathCaches[pc].len:
+        if pathCaches[pc].len > 0: #for i in 0..<pathCaches[pc].len:
+          let i = pathCaches[pc].high
           pathCaches[pc][i].hull.taintWrite(cfg[pc].n)
           pathCaches[pc][i].internalState.notLastReads.incl newNotLastReads
           pathCaches[pc][i].internalState.lastReads.incl newLastReads
@@ -268,17 +263,8 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         handleCache(dest)
         cfg.mergeStates(states[dest], move state)
       of use:
-        #use:
-        #  potentialLastReads.excl:
-        #    notLastReads.incl:
-        #      all maybe aliased by the use loc (exclMaybeAliased)
-        #      all that would maybe alias the use loc (exclmaybeAliasing)
-        #  potentialLastReads.incl:
-        #    the use loc
-
         var newNotLastReads = state.potentialLastReads.exclMaybeAliased(cfg[pc].n)
         newNotLastReads.incl state.potentialLastReads.exclMaybeAliasing(cfg[pc].n)
-
         state.notLastReads.incl newNotLastReads
 
         for i in toIntSet(newNotLastReads):
@@ -287,7 +273,8 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         state.potentialLastReads.incl(cfg[pc].n, pc)
 
         # Cache read:
-        for i in 0..<pathCaches[pc].len:
+        if pathCaches[pc].len > 0: #for i in 0..<pathCaches[pc].len:
+          let i = pathCaches[pc].high
           pathCaches[pc][i].hull.taintRead(cfg[pc].n)
           pathCaches[pc][i].internalState.notLastReads.incl newNotLastReads
           pathCaches[pc][i].internalState.potentialLastReads.incl(cfg[pc].n, pc)
@@ -307,8 +294,8 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         cfg.mergeStates(states[destA], copy state)
         cfg.mergeStates(states[destB], move state)
       of cachew:
-        dbg: echo "Adding cache: ",pc,"..",pc + cfg[pc].dest
-        activeCaches.add Cache(start: pc, stop: pc + cfg[pc].dest)
+        dbg: echo "Adding cache: ",pc..<pc + cfg[pc].dest
+        activeCaches.add Cache(area: pc..<pc + cfg[pc].dest)
         pathCaches[pc].add PathCache(
           internalState: newState(),
           hull: TaintTree(readRoot: TaintNode(), writeRoot: TaintNode()))
@@ -316,10 +303,10 @@ proc computeLastReads(cfg: ControlFlowGraph) =
         handleCache(dest)
         cfg.mergeStates(states[dest], move state)
       of cacher:
-        doAssert finishedCaches[cfg[pc].dest].start == cfg[pc].dest
+        doAssert finalCaches[cfg[pc].dest].area.a == cfg[pc].dest
         dbg: echo "Applying cache at ",pc," from ",cfg[pc].dest
 
-        for exit, pathCache in finishedCaches[cfg[pc].dest].exits:
+        for exit, pathCache in finalCaches[cfg[pc].dest].exits:
           dbg: echo "Applying pathCache to ",exit,":",pathCache.hull
           depthFirstTraversal(pathCache.hull,
             proc (r, w: TaintNode, path: seq[NodeKey]) =
