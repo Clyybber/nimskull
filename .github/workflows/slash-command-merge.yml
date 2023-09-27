@@ -23,6 +23,7 @@ jobs:
         name: Get PR data and trim PR body
         uses: actions/github-script@v6
         with:
+          debug: true
           script: |
             const pull_id = context.payload.client_payload.pull_request.node_id;
 
