@@ -23,7 +23,6 @@ jobs:
         name: Get PR data and trim PR body
         uses: actions/github-script@v6
         with:
-          debug: true
           script: |
             const pull_id = context.payload.client_payload.pull_request.node_id;
 
@@ -56,7 +55,7 @@ jobs:
               return;
             }
 
-            const formatPR = require('../../tools/ci_format_pr_description.js');
+            const formatPR = require('./tools/ci_format_pr_description.js');
 
             let [ body, body_tail ] = pr_info.body.split(/^---\s*$/m, 2);
             body = formatPR.formatPRdescription(body, 72);
