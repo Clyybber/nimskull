@@ -1657,6 +1657,15 @@ type
 
   TSym* = object of TIdObj # Keep in sync with PackedSym
     ## proc and type instantiations are cached in the generic symbol
+    options*: TOptions # QUESTION I don't understand the exact purpose of
+                       # this field - most of the time it is copied between
+                       # symbols all over the place, but checked only in
+                       # the `linter.checkDefImpl` proc (considering
+                       # the `optStyleCheck` could've been a global option
+                       # it makes it even more weird)
+    magic*: TMagic
+    extFlags*: ExternalFlags  ## additional flags that are relevant to code
+                              ## generation
     case kind*: TSymKind
     of routineKinds - {skMacro}:
       #procInstCache*: seq[PInstantiation]
@@ -1674,7 +1683,6 @@ type
       context*: int           ## the ID (i.e., index) of the execution context
                               ## this label is part of
     else: nil
-    magic*: TMagic
     typ*: PType
     name*: PIdent
     info*: TLineInfo
@@ -1690,12 +1698,6 @@ type
                               ## module after the sem pass (see appendToModule)
                               ## for skError, starting to migrate this to be the
                               ## nkError node with the necessary error info
-    options*: TOptions # QUESTION I don't understand the exact purpose of
-                       # this field - most of the time it is copied between
-                       # symbols all over the place, but checked only in
-                       # the `linter.checkDefImpl` proc (considering
-                       # the `optStyleCheck` could've been a global option
-                       # it makes it even more weird)
     position*: int            ## used for many different things:
                               ## for enum fields its position;
                               ## for fields its offset
@@ -1709,19 +1711,18 @@ type
     offset*: int              ## offset of record field
     extname*: string          ## the external name of the type, or empty if a
                               ## generated name is to be used
-    extFlags*: ExternalFlags  ## additional flags that are relevant to code
-                              ## generation
-    locId*: uint32            ## associates the symbol with a loc in the C code
-                              ## generator. 0 means unset.
-    annex*: LibId             ## additional fields (seldom used, so we use a
-                              ## reference to another object to save space)
     constraint*: PNode        ## additional constraints like 'lit|result'; also
                               ## misused for the codegenDecl pragma in the hope
                               ## it won't cause problems
                               ## for skModule the string literal to output for
                               ## deprecated modules.
+    annex*: LibId             ## additional fields (seldom used, so we use a
+                              ## reference to another object to save space)
     when defined(nimsuggest):
       allUsages*: seq[TLineInfo]
+
+    locId*: uint32            ## associates the symbol with a loc in the C code
+                              ## generator. 0 means unset.
 
   TTypeSeq* = seq[PType]
   TLockLevel* = distinct int16
@@ -1738,6 +1739,9 @@ type
     ## copies of a type in memory! Keep in sync with PackedType
     kind*: TTypeKind          ## kind of type
     callConv*: TCallingConvention ## for procs
+    align*: int16             ## the type's alignment requirements
+    paddingAtEnd*: int16      ##
+    lockLevel*: TLockLevel    ## lock level as required for deadlock checking
     flags*: TTypeFlags        ## flags of the type
     sons*: TTypeSeq           ## base types, etc.
     n*: PNode                 ## node for types:
@@ -1755,9 +1759,6 @@ type
                               ## it is used for converting types to strings
     size*: BiggestInt         ## the size of the type in bytes
                               ## -1 means that the size is unkwown
-    align*: int16             ## the type's alignment requirements
-    paddingAtEnd*: int16      ##
-    lockLevel*: TLockLevel    ## lock level as required for deadlock checking
     typeInst*: PType          ## for generic instantiations the tyGenericInst that led to this
                               ## type; for tyError the previous type if avaiable
     uniqueId*: ItemId         ## due to a design mistake, we need to keep the real ID here as it
