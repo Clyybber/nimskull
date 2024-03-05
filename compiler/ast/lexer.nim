@@ -231,15 +231,15 @@ func diagToHumanStr*(d: LexerDiag): string =
 type
   Token* = object             ## a Nim token
     tokType*: TokType         ## the type of the token
+    base*: NumericalBase      ## the numerical base; only valid for int
+                              ## or float literals
+    strongSpaceA*: int8       ## leading spaces of an operator
+    strongSpaceB*: int8       ## trailing spaces of an operator
     indent*: int              ## the indentation; != -1 if the token has been
                               ## preceded with indentation
     ident*: PIdent            ## the parsed identifier
     iNumber*: BiggestInt      ## the parsed integer literal
     fNumber*: BiggestFloat    ## the parsed floating point literal
-    base*: NumericalBase      ## the numerical base; only valid for int
-                              ## or float literals
-    strongSpaceA*: int8       ## leading spaces of an operator
-    strongSpaceB*: int8       ## trailing spaces of an operator
     literal*: string          ## the parsed (string) literal; and
                               ## documentation comments are here too
     line*, col*: int

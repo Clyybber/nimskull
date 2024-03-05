@@ -220,10 +220,10 @@ type
     line*: uint16
     col*: int16
     tokType*: TokType
+    base*: NumericalBase
     ident*: PIdent
     iNumber*: BiggestInt
     fNumber*: BiggestFloat
-    base*: NumericalBase
     literal*: string
 
   ParsedNodeData*{.final, acyclic.} = object
