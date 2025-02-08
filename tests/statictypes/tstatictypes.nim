@@ -417,7 +417,6 @@ block coercion_to_static_type:
   # the call must be fully evaluated at compile-time
   doAssert static[int](get()) == 1
 
-
 proc reciprocal(f: static float): float =
   1 / f
 
