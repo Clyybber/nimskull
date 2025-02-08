@@ -44,7 +44,7 @@ template cmpFloatRep*(a, b: BiggestFloat): bool =
   ## Compares the bit-representation of floats `a` and `b`
   # Special handling for floats, so that floats that have the same
   # value but different bit representations are treated as different constants
-  # As opposed to float equality this does not lack the substition or
+  # Compared to float equality, this does not lack the substitution and
   # reflexivity property, which the compiler relies on for correctness.
   cast[uint64](a) == cast[uint64](b)
 
